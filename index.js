@@ -121,10 +121,72 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+function pickFirstUrl(...candidates) {
+  for (const item of candidates) {
+    if (!item) continue;
+
+    if (typeof item === "string" && item.trim()) {
+      return item.trim();
+    }
+
+    if (Array.isArray(item)) {
+      const found = item.find((x) => typeof x === "string" && x.trim());
+      if (found) return found.trim();
+    }
+  }
+  return null;
+}
+
+function normalizeImageUrl(url) {
+  if (!url) return null;
+
+  let finalUrl = String(url).trim();
+
+  finalUrl = finalUrl.replace(/\\u002F/g, "/");
+  finalUrl = finalUrl.replace(/&amp;/g, "&");
+
+  if (finalUrl.startsWith("//")) {
+    finalUrl = `https:${finalUrl}`;
+  }
+
+  if (!/^https?:\/\//i.test(finalUrl)) return null;
+  return finalUrl;
+}
+
+async function fetchImageBuffer(url) {
+  const normalized = normalizeImageUrl(url);
+  if (!normalized) throw new Error("Invalid image url");
+
+  const res = await fetch(normalized, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      referer: "https://www.tiktok.com/",
+      origin: "https://www.tiktok.com",
+      "accept-language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+      pragma: "no-cache",
+      "cache-control": "no-cache",
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Image request failed with status ${res.status}`);
+  }
+
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
 async function safeLoadImage(url, width = 1280, height = 720, fallbackType = "bg") {
   try {
     if (!url) throw new Error("Empty image url");
-    return await loadImage(url);
+
+    const normalized = normalizeImageUrl(url);
+    if (!normalized) throw new Error("Invalid normalized url");
+
+    const buffer = await fetchImageBuffer(normalized);
+    return await loadImage(buffer);
   } catch (error) {
     console.warn("safeLoadImage fallback:", error?.message || error);
 
@@ -442,6 +504,7 @@ function createState(username) {
     isConnecting: false,
     announcedLive: false,
     endAnnounced: false,
+    endSending: false,
     roomId: null,
     lastLiveAt: null,
     lastEndedAt: null,
@@ -463,48 +526,97 @@ function getState(username) {
   return liveStates.get(username);
 }
 
-function extractProfileFromRoomInfo(state, roomInfo) {
-  if (!roomInfo) return;
+function extractUserLikeAvatar(userLike) {
+  if (!userLike) return null;
 
-  const owner =
-    roomInfo?.owner ||
-    roomInfo?.host ||
-    roomInfo?.user ||
-    roomInfo?.userInfo ||
-    null;
+  return pickFirstUrl(
+    userLike?.avatarThumb?.urlList,
+    userLike?.avatarMedium?.urlList,
+    userLike?.avatarLarge?.urlList,
+    userLike?.avatarLarger?.urlList,
+    userLike?.avatar?.urlList,
+    userLike?.avatar_thumb?.url_list,
+    userLike?.avatar_medium?.url_list,
+    userLike?.avatar_large?.url_list,
+    userLike?.avatar_larger?.url_list,
+    userLike?.avatarUrl,
+    userLike?.avatar_url,
+    userLike?.profilePictureUrl,
+    userLike?.profile_picture_url
+  );
+}
+
+function extractProfileFromAny(state, source) {
+  if (!source) return;
+
+  const possibleUsers = [
+    source?.owner,
+    source?.host,
+    source?.user,
+    source?.userInfo,
+    source?.anchor,
+    source?.broadcaster,
+    source?.roomInfo?.owner,
+    source?.roomInfo?.host,
+    source?.roomInfo?.user,
+    source?.roomInfo?.userInfo,
+    source?.ownerInfo,
+    source?.hostInfo,
+  ].filter(Boolean);
+
+  for (const user of possibleUsers) {
+    const nextName =
+      user?.nickname ||
+      user?.displayName ||
+      user?.uniqueId ||
+      user?.unique_id ||
+      null;
+
+    const nextAvatar = extractUserLikeAvatar(user);
+
+    if (nextName) {
+      state.displayName = nextName;
+      break;
+    }
+
+    if (nextAvatar && !state.avatarUrl) {
+      state.avatarUrl = normalizeImageUrl(nextAvatar);
+    }
+  }
+
+  for (const user of possibleUsers) {
+    const nextAvatar = extractUserLikeAvatar(user);
+    if (nextAvatar) {
+      state.avatarUrl = normalizeImageUrl(nextAvatar);
+      break;
+    }
+  }
 
   state.displayName =
-    owner?.nickname ||
-    owner?.displayName ||
-    roomInfo?.titleOwnerName ||
     state.displayName ||
+    source?.titleOwnerName ||
+    source?.ownerName ||
     state.username;
 
-  state.avatarUrl =
-    owner?.avatarThumb?.urlList?.[0] ||
-    owner?.avatarMedium?.urlList?.[0] ||
-    owner?.avatarLarge?.urlList?.[0] ||
-    owner?.avatarLarger?.urlList?.[0] ||
-    owner?.avatar?.urlList?.[0] ||
-    owner?.avatarUrl ||
-    state.avatarUrl;
-
   state.liveTitle =
-    roomInfo?.title ||
-    roomInfo?.roomInfo?.title ||
+    source?.title ||
+    source?.description ||
+    source?.roomInfo?.title ||
     state.liveTitle;
 
   state.viewers =
-    roomInfo?.stats?.userCount ??
-    roomInfo?.stats?.viewerCount ??
-    roomInfo?.stats?.totalUser ??
+    source?.stats?.userCount ??
+    source?.stats?.viewerCount ??
+    source?.stats?.totalUser ??
+    source?.viewerCount ??
+    source?.total ??
     state.viewers;
 }
 
 async function fetchRoomData(state) {
   try {
     const roomInfo = await state.conn.fetchRoomInfo();
-    extractProfileFromRoomInfo(state, roomInfo);
+    extractProfileFromAny(state, roomInfo);
     return roomInfo;
   } catch (err) {
     console.warn(`[${state.username}] fetchRoomInfo failed:`, err?.message || err);
@@ -524,13 +636,19 @@ function buildLiveEmbed(state) {
     "Klik tombol di bawah untuk langsung masuk ke TikTok LIVE.",
   ].filter(Boolean);
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(0xfe2c55)
     .setTitle("🔴 TikTok LIVE Terdeteksi")
     .setDescription(lines.join("\n"))
     .setURL(getTikTokUrl(state.username))
     .setFooter({ text: `Detected at ${fmtDateID(nowIso())} WIB` })
     .setTimestamp();
+
+  if (state.avatarUrl) {
+    embed.setThumbnail(state.avatarUrl);
+  }
+
+  return embed;
 }
 
 function buildEndLiveEmbed(state) {
@@ -542,13 +660,19 @@ function buildEndLiveEmbed(state) {
     "Live barusan sudah berakhir.",
   ].filter(Boolean);
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(0x9ca3af)
     .setTitle("⏹️ TikTok LIVE Selesai")
     .setDescription(lines.join("\n"))
     .setURL(getTikTokUrl(state.username))
     .setFooter({ text: `Ended at ${fmtDateID(nowIso())} WIB` })
     .setTimestamp();
+
+  if (state.avatarUrl) {
+    embed.setThumbnail(state.avatarUrl);
+  }
+
+  return embed;
 }
 
 function buildLiveButtons(state) {
@@ -578,6 +702,21 @@ async function getAnnounceChannel() {
   return channel;
 }
 
+async function sendAndPublish(channel, payload) {
+  const message = await channel.send(payload);
+
+  if (channel.type === ChannelType.GuildAnnouncement) {
+    try {
+      await message.crosspost();
+      console.log(`[channel:${channel.id}] announcement published`);
+    } catch (err) {
+      console.warn(`[channel:${channel.id}] crosspost failed:`, err?.message || err);
+    }
+  }
+
+  return message;
+}
+
 async function sendLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
 
@@ -593,7 +732,7 @@ async function sendLiveAnnouncement(state) {
     name: `tiktok-live-${state.username}-${Date.now()}.png`,
   });
 
-  await channel.send({
+  await sendAndPublish(channel, {
     content: MENTION_EVERYONE
       ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!`
       : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!`,
@@ -607,6 +746,8 @@ async function sendLiveAnnouncement(state) {
 async function sendEndLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
 
+  await fetchRoomData(state);
+
   const bannerBuffer = await createEndLiveBanner({
     username: state.username,
     displayName: state.displayName || state.username,
@@ -617,7 +758,7 @@ async function sendEndLiveAnnouncement(state) {
     name: `tiktok-ended-${state.username}-${Date.now()}.png`,
   });
 
-  await channel.send({
+  await sendAndPublish(channel, {
     content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.`,
     files: [bannerAttachment],
     embeds: [buildEndLiveEmbed(state)],
@@ -631,12 +772,15 @@ async function markEnded(state, options = {}) {
   const wasLiveSession =
     state.isLive || state.announcedLive || state.isConnecting;
 
-  if (sendAnnouncement && wasLiveSession && !state.endAnnounced) {
+  if (sendAnnouncement && wasLiveSession && !state.endAnnounced && !state.endSending) {
+    state.endSending = true;
     try {
       await sendEndLiveAnnouncement(state);
       state.endAnnounced = true;
     } catch (err) {
       console.error(`[${state.username}] failed to send end announcement:`, err);
+    } finally {
+      state.endSending = false;
     }
   }
 
@@ -660,8 +804,11 @@ function bindTikTokEvents(state) {
     state.isConnecting = false;
     state.isLive = true;
     state.endAnnounced = false;
+    state.endSending = false;
     state.roomId = connState?.roomId || state.roomId;
     state.lastLiveAt = state.lastLiveAt || nowIso();
+
+    extractProfileFromAny(state, connState);
 
     console.log(`[${username}] CONNECTED roomId=${state.roomId}`);
 
@@ -687,6 +834,8 @@ function bindTikTokEvents(state) {
   });
 
   conn.on(WebcastEvent.LIVE_INTRO, (msg) => {
+    extractProfileFromAny(state, msg);
+
     state.displayName =
       msg?.host?.nickname ||
       msg?.host?.displayName ||
@@ -698,6 +847,8 @@ function bindTikTokEvents(state) {
   });
 
   conn.on(WebcastEvent.ROOM_USER, (msg) => {
+    extractProfileFromAny(state, msg);
+
     const maybeViewer =
       msg?.viewerCount ??
       msg?.total ??
@@ -728,6 +879,7 @@ async function ensureLiveConnection(state) {
       return;
     }
 
+    await fetchRoomData(state);
     await state.conn.connect();
   } catch (err) {
     state.isConnecting = false;
