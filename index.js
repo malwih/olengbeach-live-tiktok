@@ -1,6 +1,7 @@
 import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import {
   Client,
   GatewayIntentBits,
@@ -11,14 +12,14 @@ import {
   ActionRowBuilder,
   AttachmentBuilder,
 } from "discord.js";
-import TikTokLiveConnector from "tiktok-live-connector";
+import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
+const require = createRequire(import.meta.url);
 const {
   TikTokLiveConnection,
   ControlEvent,
   WebcastEvent,
-} = TikTokLiveConnector;
-import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
+} = require("tiktok-live-connector");
 
 // ========= PATH =========
 const __filename = fileURLToPath(import.meta.url);
@@ -764,7 +765,7 @@ async function sweepTikTokLives() {
 }
 
 // ========= START =========
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Monitoring: ${TIKTOK_USERNAMES.join(", ")}`);
 
