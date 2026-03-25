@@ -10,6 +10,6 @@
     "@napi-rs/canvas": "^0.1.97",
     "discord.js": "^14.25.1",
     "dotenv": "^17.3.1",
-    "tiktok-live-connector": "^1.2.3"
+    "tiktok-live-connector": "2.0.0"
   }
 }

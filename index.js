@@ -1,7 +1,6 @@
 import "dotenv/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
 import {
   Client,
   GatewayIntentBits,
@@ -12,14 +11,12 @@ import {
   ActionRowBuilder,
   AttachmentBuilder,
 } from "discord.js";
-import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
-
-const require = createRequire(import.meta.url);
-const {
+import {
   TikTokLiveConnection,
   ControlEvent,
   WebcastEvent,
-} = require("tiktok-live-connector");
+} from "tiktok-live-connector";
+import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 // ========= PATH =========
 const __filename = fileURLToPath(import.meta.url);
