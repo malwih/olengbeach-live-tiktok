@@ -11,11 +11,13 @@ import {
   ActionRowBuilder,
   AttachmentBuilder,
 } from "discord.js";
-import {
+import TikTokLiveConnector from "tiktok-live-connector";
+
+const {
   TikTokLiveConnection,
   ControlEvent,
   WebcastEvent,
-} from "tiktok-live-connector";
+} = TikTokLiveConnector;
 import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
 // ========= PATH =========
