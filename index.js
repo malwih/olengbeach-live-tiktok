@@ -39,7 +39,6 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID;
 
-// Bisa satu atau banyak akun, pisahkan koma
 const TIKTOK_USERNAMES = String(process.env.TIKTOK_USERNAMES || "")
   .split(",")
   .map((x) => x.trim().replace(/^@/, ""))
@@ -53,6 +52,9 @@ const SERVER_NAME = process.env.SERVER_NAME || "OLENG BEACH";
 const LIVE_BG_URL =
   process.env.LIVE_BG_URL ||
   "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1600&auto=format&fit=crop";
+
+// berapa kali poll offline berturut-turut sebelum dianggap benar-benar selesai
+const OFFLINE_CONFIRM_TICKS = Number(process.env.OFFLINE_CONFIRM_TICKS || 2);
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!GUILD_ID) throw new Error("Missing GUILD_ID");
@@ -79,6 +81,10 @@ function fmtDateID(dateLike) {
 
 function getTikTokUrl(username) {
   return `https://www.tiktok.com/@${username}/live`;
+}
+
+function getTikTokProfileUrl(username) {
+  return `https://www.tiktok.com/@${username}`;
 }
 
 function getFontFamily(weight = "regular") {
@@ -121,13 +127,18 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
+function pickFirstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
 function pickFirstUrl(...candidates) {
   for (const item of candidates) {
     if (!item) continue;
 
-    if (typeof item === "string" && item.trim()) {
-      return item.trim();
-    }
+    if (typeof item === "string" && item.trim()) return item.trim();
 
     if (Array.isArray(item)) {
       const found = item.find((x) => typeof x === "string" && x.trim());
@@ -141,16 +152,34 @@ function normalizeImageUrl(url) {
   if (!url) return null;
 
   let finalUrl = String(url).trim();
+  finalUrl = finalUrl.replace(/\\u002F/g, "/").replace(/&amp;/g, "&");
 
-  finalUrl = finalUrl.replace(/\\u002F/g, "/");
-  finalUrl = finalUrl.replace(/&amp;/g, "&");
+  if (finalUrl.startsWith("//")) finalUrl = `https:${finalUrl}`;
+  if (!/^https?:\/\//i.test(finalUrl)) return null;
 
-  if (finalUrl.startsWith("//")) {
-    finalUrl = `https:${finalUrl}`;
+  return finalUrl;
+}
+
+async function fetchText(url) {
+  const res = await fetch(url, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "accept-language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+      pragma: "no-cache",
+      "cache-control": "no-cache",
+      referer: "https://www.google.com/",
+    },
+    redirect: "follow",
+  });
+
+  if (!res.ok) {
+    throw new Error(`Request failed: ${res.status}`);
   }
 
-  if (!/^https?:\/\//i.test(finalUrl)) return null;
-  return finalUrl;
+  return await res.text();
 }
 
 async function fetchImageBuffer(url) {
@@ -174,18 +203,167 @@ async function fetchImageBuffer(url) {
     throw new Error(`Image request failed with status ${res.status}`);
   }
 
-  const arrayBuffer = await res.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  const ab = await res.arrayBuffer();
+  return Buffer.from(ab);
+}
+
+function extractUserLikeAvatar(userLike) {
+  if (!userLike) return null;
+
+  return pickFirstUrl(
+    userLike?.avatarThumb?.urlList,
+    userLike?.avatarMedium?.urlList,
+    userLike?.avatarLarge?.urlList,
+    userLike?.avatarLarger?.urlList,
+    userLike?.avatar?.urlList,
+    userLike?.avatar_thumb?.url_list,
+    userLike?.avatar_medium?.url_list,
+    userLike?.avatar_large?.url_list,
+    userLike?.avatar_larger?.url_list,
+    userLike?.avatarUrl,
+    userLike?.avatar_url,
+    userLike?.avatarUri,
+    userLike?.avatar_uri,
+    userLike?.profilePictureUrl,
+    userLike?.profile_picture_url
+  );
+}
+
+function extractProfileFromAny(state, source) {
+  if (!source) return;
+
+  const possibleUsers = [
+    source?.owner,
+    source?.host,
+    source?.user,
+    source?.userInfo,
+    source?.anchor,
+    source?.broadcaster,
+    source?.ownerInfo,
+    source?.hostInfo,
+    source?.roomInfo?.owner,
+    source?.roomInfo?.host,
+    source?.roomInfo?.user,
+    source?.roomInfo?.userInfo,
+    source?.data?.owner,
+    source?.data?.user,
+  ].filter(Boolean);
+
+  for (const user of possibleUsers) {
+    const nextName = pickFirstString(
+      user?.nickname,
+      user?.displayName,
+      user?.uniqueId,
+      user?.unique_id
+    );
+
+    const nextAvatar = normalizeImageUrl(extractUserLikeAvatar(user));
+
+    if (nextName) state.displayName = nextName;
+    if (nextAvatar) state.avatarUrl = nextAvatar;
+
+    if (state.displayName && state.avatarUrl) break;
+  }
+
+  state.liveTitle =
+    pickFirstString(
+      source?.title,
+      source?.description,
+      source?.roomInfo?.title,
+      source?.data?.title
+    ) || state.liveTitle;
+
+  state.viewers =
+    source?.stats?.userCount ??
+    source?.stats?.viewerCount ??
+    source?.stats?.totalUser ??
+    source?.viewerCount ??
+    source?.total ??
+    state.viewers;
+}
+
+async function fetchTikTokProfileFallback(username) {
+  try {
+    const html = await fetchText(getTikTokProfileUrl(username));
+
+    let avatarUrl = null;
+    let displayName = null;
+
+    // og:image fallback
+    const ogImageMatch = html.match(
+      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
+    );
+    if (ogImageMatch?.[1]) {
+      avatarUrl = normalizeImageUrl(ogImageMatch[1]);
+    }
+
+    // title/meta fallback
+    const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+    if (titleMatch?.[1]) {
+      const raw = titleMatch[1].trim();
+      const cleaned = raw.split(" | ")[0]?.trim();
+      if (cleaned && !cleaned.startsWith("@")) {
+        displayName = cleaned;
+      }
+    }
+
+    // SIGI_STATE JSON
+    const sigiMatch = html.match(
+      /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
+    );
+
+    if (sigiMatch?.[1]) {
+      try {
+        const jsonText = sigiMatch[1];
+        const data = JSON.parse(jsonText);
+
+        const whole = JSON.stringify(data);
+
+        const avatarCandidates = [
+          ...whole.matchAll(/"avatarLarger":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatarLarge":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatarMedium":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatarThumb":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatar":"(https?:[^"]+)"/g),
+        ].map((m) => normalizeImageUrl(m[1]));
+
+        avatarUrl = avatarUrl || avatarCandidates.find(Boolean) || null;
+
+        const nicknameMatch = whole.match(/"nickname":"([^"]+)"/);
+        if (nicknameMatch?.[1]) {
+          displayName = displayName || nicknameMatch[1];
+        }
+      } catch {}
+    }
+
+    return {
+      avatarUrl: avatarUrl || null,
+      displayName: displayName || null,
+    };
+  } catch (err) {
+    console.warn(`[${username}] profile fallback failed:`, err?.message || err);
+    return {
+      avatarUrl: null,
+      displayName: null,
+    };
+  }
+}
+
+async function hydrateProfile(state) {
+  await fetchRoomData(state);
+
+  if (!state.avatarUrl || !state.displayName || state.displayName === state.username) {
+    const fallback = await fetchTikTokProfileFallback(state.username);
+
+    if (fallback.displayName) state.displayName = fallback.displayName;
+    if (fallback.avatarUrl) state.avatarUrl = fallback.avatarUrl;
+  }
 }
 
 async function safeLoadImage(url, width = 1280, height = 720, fallbackType = "bg") {
   try {
     if (!url) throw new Error("Empty image url");
-
-    const normalized = normalizeImageUrl(url);
-    if (!normalized) throw new Error("Invalid normalized url");
-
-    const buffer = await fetchImageBuffer(normalized);
+    const buffer = await fetchImageBuffer(url);
     return await loadImage(buffer);
   } catch (error) {
     console.warn("safeLoadImage fallback:", error?.message || error);
@@ -500,11 +678,12 @@ function createState(username) {
   const state = {
     username,
     conn,
+
     isLive: false,
     isConnecting: false,
     announcedLive: false,
     endAnnounced: false,
-    endSending: false,
+    liveMessageSent: false,
     roomId: null,
     lastLiveAt: null,
     lastEndedAt: null,
@@ -513,6 +692,10 @@ function createState(username) {
     avatarUrl: null,
     liveTitle: null,
     viewers: null,
+
+    lastPollLive: false,
+    offlineTicks: 0,
+    activeSessionId: null,
   };
 
   bindTikTokEvents(state);
@@ -524,93 +707,6 @@ function getState(username) {
     liveStates.set(username, createState(username));
   }
   return liveStates.get(username);
-}
-
-function extractUserLikeAvatar(userLike) {
-  if (!userLike) return null;
-
-  return pickFirstUrl(
-    userLike?.avatarThumb?.urlList,
-    userLike?.avatarMedium?.urlList,
-    userLike?.avatarLarge?.urlList,
-    userLike?.avatarLarger?.urlList,
-    userLike?.avatar?.urlList,
-    userLike?.avatar_thumb?.url_list,
-    userLike?.avatar_medium?.url_list,
-    userLike?.avatar_large?.url_list,
-    userLike?.avatar_larger?.url_list,
-    userLike?.avatarUrl,
-    userLike?.avatar_url,
-    userLike?.profilePictureUrl,
-    userLike?.profile_picture_url
-  );
-}
-
-function extractProfileFromAny(state, source) {
-  if (!source) return;
-
-  const possibleUsers = [
-    source?.owner,
-    source?.host,
-    source?.user,
-    source?.userInfo,
-    source?.anchor,
-    source?.broadcaster,
-    source?.roomInfo?.owner,
-    source?.roomInfo?.host,
-    source?.roomInfo?.user,
-    source?.roomInfo?.userInfo,
-    source?.ownerInfo,
-    source?.hostInfo,
-  ].filter(Boolean);
-
-  for (const user of possibleUsers) {
-    const nextName =
-      user?.nickname ||
-      user?.displayName ||
-      user?.uniqueId ||
-      user?.unique_id ||
-      null;
-
-    const nextAvatar = extractUserLikeAvatar(user);
-
-    if (nextName) {
-      state.displayName = nextName;
-      break;
-    }
-
-    if (nextAvatar && !state.avatarUrl) {
-      state.avatarUrl = normalizeImageUrl(nextAvatar);
-    }
-  }
-
-  for (const user of possibleUsers) {
-    const nextAvatar = extractUserLikeAvatar(user);
-    if (nextAvatar) {
-      state.avatarUrl = normalizeImageUrl(nextAvatar);
-      break;
-    }
-  }
-
-  state.displayName =
-    state.displayName ||
-    source?.titleOwnerName ||
-    source?.ownerName ||
-    state.username;
-
-  state.liveTitle =
-    source?.title ||
-    source?.description ||
-    source?.roomInfo?.title ||
-    state.liveTitle;
-
-  state.viewers =
-    source?.stats?.userCount ??
-    source?.stats?.viewerCount ??
-    source?.stats?.totalUser ??
-    source?.viewerCount ??
-    source?.total ??
-    state.viewers;
 }
 
 async function fetchRoomData(state) {
@@ -675,11 +771,11 @@ function buildEndLiveEmbed(state) {
   return embed;
 }
 
-function buildLiveButtons(state) {
+function buildButtons(state) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setLabel("🎥 Tonton TikTok LIVE")
+        .setLabel("🎥 Buka TikTok")
         .setStyle(ButtonStyle.Link)
         .setURL(getTikTokUrl(state.username))
     ),
@@ -708,7 +804,7 @@ async function sendAndPublish(channel, payload) {
   if (channel.type === ChannelType.GuildAnnouncement) {
     try {
       await message.crosspost();
-      console.log(`[channel:${channel.id}] announcement published`);
+      console.log(`[channel:${channel.id}] published`);
     } catch (err) {
       console.warn(`[channel:${channel.id}] crosspost failed:`, err?.message || err);
     }
@@ -719,8 +815,7 @@ async function sendAndPublish(channel, payload) {
 
 async function sendLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
-
-  await fetchRoomData(state);
+  await hydrateProfile(state);
 
   const bannerBuffer = await createLiveBanner({
     username: state.username,
@@ -738,15 +833,14 @@ async function sendLiveAnnouncement(state) {
       : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!`,
     files: [bannerAttachment],
     embeds: [buildLiveEmbed(state)],
-    components: buildLiveButtons(state),
+    components: buildButtons(state),
     allowedMentions: MENTION_EVERYONE ? { parse: ["everyone"] } : {},
   });
 }
 
 async function sendEndLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
-
-  await fetchRoomData(state);
+  await hydrateProfile(state);
 
   const bannerBuffer = await createEndLiveBanner({
     username: state.username,
@@ -762,39 +856,50 @@ async function sendEndLiveAnnouncement(state) {
     content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.`,
     files: [bannerAttachment],
     embeds: [buildEndLiveEmbed(state)],
-    components: buildLiveButtons(state),
+    components: buildButtons(state),
   });
 }
 
-async function markEnded(state, options = {}) {
-  const { sendAnnouncement = false } = options;
-
-  const wasLiveSession =
-    state.isLive || state.announcedLive || state.isConnecting;
-
-  if (sendAnnouncement && wasLiveSession && !state.endAnnounced && !state.endSending) {
-    state.endSending = true;
-    try {
-      await sendEndLiveAnnouncement(state);
-      state.endAnnounced = true;
-    } catch (err) {
-      console.error(`[${state.username}] failed to send end announcement:`, err);
-    } finally {
-      state.endSending = false;
-    }
-  }
-
+function resetLiveFlagsAfterEnd(state) {
   state.isLive = false;
   state.isConnecting = false;
   state.announcedLive = false;
+  state.liveMessageSent = false;
+  state.endAnnounced = false;
   state.roomId = null;
-  state.lastEndedAt = nowIso();
   state.liveTitle = null;
   state.viewers = null;
+  state.lastEndedAt = nowIso();
+  state.activeSessionId = null;
 
   try {
     state.conn.disconnect();
   } catch {}
+}
+
+async function announceLiveIfNeeded(state) {
+  if (state.liveMessageSent) return;
+
+  try {
+    await sendLiveAnnouncement(state);
+    state.liveMessageSent = true;
+    state.announcedLive = true;
+    console.log(`[${state.username}] live announcement sent`);
+  } catch (err) {
+    console.error(`[${state.username}] failed live announcement:`, err);
+  }
+}
+
+async function announceEndIfNeeded(state) {
+  if (state.endAnnounced) return;
+
+  try {
+    await sendEndLiveAnnouncement(state);
+    state.endAnnounced = true;
+    console.log(`[${state.username}] end announcement sent`);
+  } catch (err) {
+    console.error(`[${state.username}] failed end announcement:`, err);
+  }
 }
 
 function bindTikTokEvents(state) {
@@ -803,24 +908,18 @@ function bindTikTokEvents(state) {
   conn.on(ControlEvent.CONNECTED, async (connState) => {
     state.isConnecting = false;
     state.isLive = true;
-    state.endAnnounced = false;
-    state.endSending = false;
+    state.offlineTicks = 0;
+    state.lastPollLive = true;
     state.roomId = connState?.roomId || state.roomId;
     state.lastLiveAt = state.lastLiveAt || nowIso();
+    state.activeSessionId = state.activeSessionId || `${username}:${Date.now()}`;
+    state.endAnnounced = false;
 
     extractProfileFromAny(state, connState);
 
     console.log(`[${username}] CONNECTED roomId=${state.roomId}`);
 
-    if (!state.announcedLive) {
-      try {
-        await sendLiveAnnouncement(state);
-        state.announcedLive = true;
-        console.log(`[${username}] announcement sent`);
-      } catch (err) {
-        console.error(`[${username}] failed to send announcement:`, err);
-      }
-    }
+    await announceLiveIfNeeded(state);
   });
 
   conn.on(ControlEvent.DISCONNECTED, ({ code, reason }) => {
@@ -835,34 +934,16 @@ function bindTikTokEvents(state) {
 
   conn.on(WebcastEvent.LIVE_INTRO, (msg) => {
     extractProfileFromAny(state, msg);
-
-    state.displayName =
-      msg?.host?.nickname ||
-      msg?.host?.displayName ||
-      state.displayName;
-
-    state.liveTitle =
-      msg?.description ||
-      state.liveTitle;
   });
 
   conn.on(WebcastEvent.ROOM_USER, (msg) => {
     extractProfileFromAny(state, msg);
-
-    const maybeViewer =
-      msg?.viewerCount ??
-      msg?.total ??
-      msg?.stats?.viewerCount ??
-      null;
-
-    if (maybeViewer != null) {
-      state.viewers = maybeViewer;
-    }
   });
 
   conn.on(WebcastEvent.STREAM_END, async ({ action }) => {
     console.log(`[${username}] STREAM_END action=${action}`);
-    await markEnded(state, { sendAnnouncement: true });
+    await announceEndIfNeeded(state);
+    resetLiveFlagsAfterEnd(state);
   });
 }
 
@@ -879,11 +960,70 @@ async function ensureLiveConnection(state) {
       return;
     }
 
-    await fetchRoomData(state);
-    await state.conn.connect();
+    state.lastLiveAt = state.lastLiveAt || nowIso();
+    state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
+    state.offlineTicks = 0;
+    state.lastPollLive = true;
+    state.isLive = true;
+
+    await hydrateProfile(state);
+
+    try {
+      await state.conn.connect();
+    } catch (err) {
+      console.warn(`[${state.username}] connect stream failed:`, err?.message || err);
+    }
+
+    await announceLiveIfNeeded(state);
   } catch (err) {
     state.isConnecting = false;
     console.warn(`[${state.username}] connect failed:`, err?.message || err);
+  } finally {
+    state.isConnecting = false;
+  }
+}
+
+async function handlePolledOffline(state) {
+  state.offlineTicks += 1;
+  state.lastPollLive = false;
+
+  const hadActiveSession =
+    state.isLive || state.liveMessageSent || state.announcedLive || !!state.activeSessionId;
+
+  if (!hadActiveSession) {
+    resetLiveFlagsAfterEnd(state);
+    return;
+  }
+
+  if (state.offlineTicks < OFFLINE_CONFIRM_TICKS) {
+    console.log(
+      `[${state.username}] offline tick ${state.offlineTicks}/${OFFLINE_CONFIRM_TICKS}`
+    );
+    return;
+  }
+
+  console.log(`[${state.username}] confirmed offline, sending end announcement`);
+  await announceEndIfNeeded(state);
+  resetLiveFlagsAfterEnd(state);
+}
+
+async function handlePolledLive(state) {
+  state.offlineTicks = 0;
+  state.lastPollLive = true;
+  state.isLive = true;
+  state.lastLiveAt = state.lastLiveAt || nowIso();
+  state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
+  state.endAnnounced = false;
+
+  await hydrateProfile(state);
+  await announceLiveIfNeeded(state);
+
+  if (!state.conn.getState || !state.conn.getState()?.isConnected) {
+    try {
+      await state.conn.connect();
+    } catch (err) {
+      console.warn(`[${state.username}] reconnect watcher failed:`, err?.message || err);
+    }
   }
 }
 
@@ -893,19 +1033,12 @@ async function sweepTikTokLives() {
 
     try {
       const liveNow = await state.conn.fetchIsLive();
+      console.log(`[${username}] poll live=${liveNow}`);
 
       if (liveNow) {
-        if (!state.isLive && !state.isConnecting) {
-          state.lastLiveAt = state.lastLiveAt || nowIso();
-          await ensureLiveConnection(state);
-        }
+        await handlePolledLive(state);
       } else {
-        if (state.isLive || state.announcedLive || state.isConnecting) {
-          console.log(`[${username}] no longer live, sending end announcement`);
-          await markEnded(state, { sendAnnouncement: true });
-        } else {
-          await markEnded(state, { sendAnnouncement: false });
-        }
+        await handlePolledOffline(state);
       }
     } catch (err) {
       console.warn(`[${username}] fetchIsLive failed:`, err?.message || err);
