@@ -14,7 +14,6 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  SlashCommandBuilder,
   PermissionsBitField,
 } from "discord.js";
 import {
@@ -45,6 +44,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID;
 const TIKTOK_TICKET_CATEGORY_ID = process.env.TIKTOK_TICKET_CATEGORY_ID;
+const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID;
 
 const TIKTOK_USERNAMES = String(process.env.TIKTOK_USERNAMES || "")
   .split(",")
@@ -76,6 +76,7 @@ if (!GUILD_ID) throw new Error("Missing GUILD_ID");
 if (!LIVE_ANNOUNCE_CHANNEL_ID) throw new Error("Missing LIVE_ANNOUNCE_CHANNEL_ID");
 if (!TIKTOK_USERNAMES.length) throw new Error("Missing TIKTOK_USERNAMES");
 if (!TIKTOK_TICKET_CATEGORY_ID) throw new Error("Missing TIKTOK_TICKET_CATEGORY_ID");
+if (!STAFF_ROLE_ID) throw new Error("Missing STAFF_ROLE_ID");
 
 // ========= CLIENT =========
 const client = new Client({
@@ -261,16 +262,23 @@ function buildTicketMeta(meta = {}) {
   ].join(" | ");
 }
 
-function canManageTicket(member, channel) {
+function memberHasStaffRole(member) {
+  if (!member || !STAFF_ROLE_ID) return false;
+  return member.roles?.cache?.has(STAFF_ROLE_ID) || false;
+}
+
+function canUseDoneButton(member, channel) {
   if (!member || !channel) return false;
+
+  if (memberHasStaffRole(member)) return true;
 
   const perms = channel.permissionsFor(member);
   if (!perms) return false;
 
   return (
+    perms.has(PermissionsBitField.Flags.Administrator) ||
     perms.has(PermissionsBitField.Flags.ManageChannels) ||
-    perms.has(PermissionsBitField.Flags.ManageMessages) ||
-    perms.has(PermissionsBitField.Flags.Administrator)
+    perms.has(PermissionsBitField.Flags.ManageMessages)
   );
 }
 
@@ -313,7 +321,7 @@ function buildTermsButtons(username, agreed = false) {
   ];
 }
 
-function buildTicketButtons(username) {
+function buildTicketButtons(username, isDone = false) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -321,28 +329,16 @@ function buildTicketButtons(username) {
         .setLabel("📋 Copy Username")
         .setStyle(ButtonStyle.Secondary),
       new ButtonBuilder()
+        .setCustomId(`ticket_done:${username}`)
+        .setLabel(isDone ? "✅ DONE" : "✅ Mark DONE")
+        .setStyle(ButtonStyle.Success)
+        .setDisabled(isDone),
+      new ButtonBuilder()
         .setCustomId(`close_ticket:${username}`)
         .setLabel("🔒 Close Ticket")
         .setStyle(ButtonStyle.Danger)
     ),
   ];
-}
-
-async function registerSlashCommands() {
-  const commands = [
-    new SlashCommandBuilder()
-      .setName("done")
-      .setDescription("Selesaikan proses ticket tertentu")
-      .addSubcommand((sub) =>
-        sub
-          .setName("livetiktok")
-          .setDescription("Tandai ticket pendaftaran TikTok Live sebagai selesai")
-      ),
-  ].map((cmd) => cmd.toJSON());
-
-  const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.commands.set(commands);
-  console.log("Slash commands registered");
 }
 
 async function fetchText(url) {
@@ -1324,8 +1320,6 @@ async function createLiveTikTokTicket({ guild, requester, username }) {
     }),
   });
 
-  // Tambahkan akses khusus user pemohon dan bot.
-  // Role staff/admin otomatis ikut permission dari category Discord.
   await channel.permissionOverwrites.edit(requester.id, {
     ViewChannel: true,
     SendMessages: true,
@@ -1349,18 +1343,21 @@ async function createLiveTikTokTicket({ guild, requester, username }) {
         `**User ID:** \`${requester.id}\``,
         `**Username TikTok:** \`${cleanUsername}\``,
         "",
-        "Staff / admin yang memang punya akses di category ini silakan proses ticket.",
-        "Jika sudah selesai, jalankan command:",
-        "`/done livetiktok`",
+        `<@&${STAFF_ROLE_ID}> silakan proses ticket ini.`,
+        "Jika sudah selesai, klik tombol **DONE** di bawah.",
       ].join("\n")
     )
     .setFooter({ text: `Created at ${fmtDateID(nowIso())} WIB` })
     .setTimestamp();
 
   await channel.send({
-    content: `${requester}`,
+    content: `${requester} <@&${STAFF_ROLE_ID}>`,
     embeds: [embed],
-    components: buildTicketButtons(cleanUsername),
+    components: buildTicketButtons(cleanUsername, false),
+    allowedMentions: {
+      users: [requester.id],
+      roles: [STAFF_ROLE_ID],
+    },
   });
 
   return channel;
@@ -1400,11 +1397,52 @@ async function scheduleAutoCloseTicket(channel) {
       if (meta.status !== "done") return;
 
       await fresh.send("⏰ 30 menit telah berlalu. Ticket akan ditutup otomatis.");
-      await closeTicketChannel(fresh, "Auto close setelah /done livetiktok");
+      await closeTicketChannel(fresh, "Auto close setelah DONE");
     } catch (err) {
       console.warn("Failed auto close ticket:", err?.message || err);
     }
   }, 30 * 60 * 1000).unref();
+}
+
+async function markTicketDone({ interaction, channel, meta, username }) {
+  await channel.setTopic(
+    buildTicketMeta({
+      type: "livetiktok",
+      username: meta.username,
+      requesterId: meta.requesterId,
+      status: "done",
+      doneAt: nowIso(),
+    })
+  );
+
+  await lockTicketForUser(channel, meta.requesterId);
+
+  await channel.send({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x22c55e)
+        .setTitle("✅ Pendaftaran TikTok Live Sudah Diproses")
+        .setDescription(
+          [
+            `Pendaftaran untuk username TikTok \`${meta.username}\` sudah diproses oleh ${interaction.user}.`,
+            "",
+            `<@${meta.requesterId}> sekarang ticket ini telah selesai diproses.`,
+            "Kamu sudah tidak bisa mengirim chat lagi di ticket ini.",
+            "Ticket akan otomatis ditutup dalam **30 menit**.",
+          ].join("\n")
+        )
+        .setTimestamp(),
+    ],
+    components: buildTicketButtons(username || meta.username, true),
+  });
+
+  await interaction.reply({
+    content:
+      "✅ Ticket ditandai selesai, user sudah diberi info, channel dikunci, dan auto close 30 menit dijadwalkan.",
+    ephemeral: true,
+  });
+
+  await scheduleAutoCloseTicket(channel);
 }
 
 // ========= INTERACTIONS =========
@@ -1520,11 +1558,57 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (action === "ticket_done") {
+        const member = interaction.member;
+        const channel = interaction.channel;
+
+        if (!canUseDoneButton(member, channel)) {
+          await interaction.reply({
+            content: "❌ Hanya staff yang memiliki role yang sesuai yang bisa klik tombol DONE.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const meta = parseTicketMeta(channel.topic || "");
+        if (meta.type !== "livetiktok") {
+          await interaction.reply({
+            content: "❌ Tombol ini hanya bisa dipakai di channel ticket TikTok Live.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        if (!meta.requesterId) {
+          await interaction.reply({
+            content: "❌ Data requester ticket tidak ditemukan.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        if (meta.status === "done") {
+          await interaction.reply({
+            content: "⚠️ Ticket ini sudah ditandai DONE sebelumnya.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await markTicketDone({
+          interaction,
+          channel,
+          meta,
+          username: normalizeUsername(value || meta.username),
+        });
+        return;
+      }
+
       if (action === "close_ticket") {
         const member = interaction.member;
         const channel = interaction.channel;
 
-        if (!canManageTicket(member, channel)) {
+        if (!canUseDoneButton(member, channel)) {
           await interaction.reply({
             content: "❌ Kamu tidak punya izin untuk menutup ticket ini.",
             ephemeral: true,
@@ -1566,81 +1650,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
     }
-
-    if (interaction.isChatInputCommand()) {
-      if (
-        interaction.commandName === "done" &&
-        interaction.options.getSubcommand() === "livetiktok"
-      ) {
-        const member = interaction.member;
-        const channel = interaction.channel;
-
-        if (!canManageTicket(member, channel)) {
-          await interaction.reply({
-            content: "❌ Kamu tidak punya izin untuk memproses ticket ini.",
-            ephemeral: true,
-          });
-          return;
-        }
-
-        const meta = parseTicketMeta(channel.topic || "");
-        if (meta.type !== "livetiktok") {
-          await interaction.reply({
-            content: "❌ Command ini hanya bisa dipakai di channel ticket TikTok Live.",
-            ephemeral: true,
-          });
-          return;
-        }
-
-        if (!meta.requesterId) {
-          await interaction.reply({
-            content: "❌ Data requester ticket tidak ditemukan.",
-            ephemeral: true,
-          });
-          return;
-        }
-
-        await channel.setTopic(
-          buildTicketMeta({
-            type: "livetiktok",
-            username: meta.username,
-            requesterId: meta.requesterId,
-            status: "done",
-            doneAt: nowIso(),
-          })
-        );
-
-        await lockTicketForUser(channel, meta.requesterId);
-
-        await channel.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x22c55e)
-              .setTitle("✅ Pendaftaran TikTok Live Sudah Diproses")
-              .setDescription(
-                [
-                  `Pendaftaran untuk username TikTok \`${meta.username}\` sudah diproses oleh ${interaction.user}.`,
-                  "",
-                  `<@${meta.requesterId}> sekarang ticket ini telah selesai diproses.`,
-                  "Kamu sudah tidak bisa mengirim chat lagi di ticket ini.",
-                  "Ticket akan otomatis ditutup dalam **30 menit**.",
-                ].join("\n")
-              )
-              .setTimestamp(),
-          ],
-          components: buildTicketButtons(meta.username),
-        });
-
-        await interaction.reply({
-          content:
-            "✅ Ticket ditandai selesai, user sudah diberi info, channel dikunci, dan auto close 30 menit dijadwalkan.",
-          ephemeral: true,
-        });
-
-        await scheduleAutoCloseTicket(channel);
-        return;
-      }
-    }
   } catch (err) {
     console.error("interaction error:", err);
 
@@ -1666,6 +1675,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Monitoring: ${TIKTOK_USERNAMES.join(", ")}`);
+  console.log(`STAFF_ROLE_ID: ${STAFF_ROLE_ID}`);
 
   try {
     await getAnnounceChannel();
@@ -1673,12 +1683,6 @@ client.once("clientReady", async () => {
   } catch (err) {
     console.error("Announcement channel error:", err);
     process.exit(1);
-  }
-
-  try {
-    await registerSlashCommands();
-  } catch (err) {
-    console.error("Slash command register error:", err);
   }
 
   await sweepTikTokLives();
