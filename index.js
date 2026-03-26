@@ -44,7 +44,7 @@ const TIKTOK_USERNAMES = String(process.env.TIKTOK_USERNAMES || "")
   .map((x) => x.trim().replace(/^@/, ""))
   .filter(Boolean);
 
-const CHECK_INTERVAL_SECONDS = Number(process.env.CHECK_INTERVAL_SECONDS || 30);
+const CHECK_INTERVAL_SECONDS = Number(process.env.CHECK_INTERVAL_SECONDS || 10);
 const MENTION_EVERYONE =
   String(process.env.MENTION_EVERYONE || "true").toLowerCase() === "true";
 
