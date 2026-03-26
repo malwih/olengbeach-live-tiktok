@@ -388,117 +388,6 @@ async function fetchImageBuffer(url) {
   return Buffer.from(ab);
 }
 
-function escapeRegExp(text) {
-  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function isValidTikTokUsernameFormat(username) {
-  const value = normalizeUsername(username);
-  if (!value) return false;
-  return /^[a-z0-9._]{2,40}$/i.test(value);
-}
-
-async function fetchTikTokProfileInfo(username) {
-  const cleanUsername = normalizeUsername(username);
-
-  if (!isValidTikTokUsernameFormat(cleanUsername)) {
-    return {
-      exists: false,
-      username: cleanUsername,
-      avatarUrl: null,
-      displayName: null,
-      profileUrl: getTikTokProfileUrl(cleanUsername),
-    };
-  }
-
-  try {
-    const html = await fetchText(getTikTokProfileUrl(cleanUsername));
-    const lowerHtml = html.toLowerCase();
-
-    let avatarUrl = null;
-    let displayName = null;
-
-    const canonicalMatch =
-      html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)["']/i) ||
-      html.match(/<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/i);
-
-    const canonicalUrl = canonicalMatch?.[1] || "";
-    const normalizedCanonicalUrl = String(canonicalUrl).toLowerCase();
-
-    const uniqueIdRegex = new RegExp(
-      `"uniqueId":"${escapeRegExp(cleanUsername)}"|"unique_id":"${escapeRegExp(cleanUsername)}"`,
-      "i"
-    );
-
-    const hasCanonicalProfile =
-      normalizedCanonicalUrl.includes(`/@${cleanUsername.toLowerCase()}`);
-    const hasExactUniqueId = uniqueIdRegex.test(html);
-
-    const hasNotFoundMarker =
-      /couldn['’]t find this account|account not found|page not available|user not found|not available/i.test(
-        lowerHtml
-      );
-
-    const ogImageMatch = html.match(
-      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
-    );
-    if (ogImageMatch?.[1]) {
-      avatarUrl = normalizeImageUrl(ogImageMatch[1]);
-    }
-
-    const sigiMatch = html.match(
-      /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
-    );
-
-    if (sigiMatch?.[1]) {
-      try {
-        const jsonText = sigiMatch[1];
-        const data = JSON.parse(jsonText);
-        const whole = JSON.stringify(data);
-
-        const avatarCandidates = [
-          ...whole.matchAll(/"avatarLarger":"(https?:[^"]+)"/g),
-          ...whole.matchAll(/"avatarLarge":"(https?:[^"]+)"/g),
-          ...whole.matchAll(/"avatarMedium":"(https?:[^"]+)"/g),
-          ...whole.matchAll(/"avatarThumb":"(https?:[^"]+)"/g),
-          ...whole.matchAll(/"avatar":"(https?:[^"]+)"/g),
-        ].map((m) => normalizeImageUrl(m[1]));
-
-        avatarUrl = avatarUrl || avatarCandidates.find(Boolean) || null;
-
-        const nicknameMatch = whole.match(/"nickname":"([^"]+)"/);
-        if (nicknameMatch?.[1] && isValidDisplayName(nicknameMatch[1], cleanUsername)) {
-          displayName = nicknameMatch[1];
-        }
-      } catch {}
-    }
-
-    const exists = (hasCanonicalProfile || hasExactUniqueId) && !hasNotFoundMarker;
-
-    return {
-      exists,
-      username: cleanUsername,
-      avatarUrl: avatarUrl || null,
-      displayName: isValidDisplayName(displayName, cleanUsername) ? displayName : null,
-      profileUrl: getTikTokProfileUrl(cleanUsername),
-    };
-  } catch (err) {
-    console.warn(`[${cleanUsername}] username validation failed:`, err?.message || err);
-    return {
-      exists: false,
-      username: cleanUsername,
-      avatarUrl: null,
-      displayName: null,
-      profileUrl: getTikTokProfileUrl(cleanUsername),
-    };
-  }
-}
-
-async function validateTikTokUsername(username) {
-  const info = await fetchTikTokProfileInfo(username);
-  return info.exists;
-}
-
 function extractUserLikeAvatar(userLike) {
   if (!userLike) return null;
 
@@ -588,18 +477,57 @@ function extractProfileFromAny(state, source) {
 }
 
 async function fetchTikTokProfileFallback(username) {
-  const info = await fetchTikTokProfileInfo(username);
-  if (!info.exists) {
+  try {
+    const html = await fetchText(getTikTokProfileUrl(username));
+
+    let avatarUrl = null;
+    let displayName = null;
+
+    const ogImageMatch = html.match(
+      /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
+    );
+    if (ogImageMatch?.[1]) {
+      avatarUrl = normalizeImageUrl(ogImageMatch[1]);
+    }
+
+    const sigiMatch = html.match(
+      /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
+    );
+
+    if (sigiMatch?.[1]) {
+      try {
+        const jsonText = sigiMatch[1];
+        const data = JSON.parse(jsonText);
+        const whole = JSON.stringify(data);
+
+        const avatarCandidates = [
+          ...whole.matchAll(/"avatarLarger":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatarLarge":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatarMedium":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatarThumb":"(https?:[^"]+)"/g),
+          ...whole.matchAll(/"avatar":"(https?:[^"]+)"/g),
+        ].map((m) => normalizeImageUrl(m[1]));
+
+        avatarUrl = avatarUrl || avatarCandidates.find(Boolean) || null;
+
+        const nicknameMatch = whole.match(/"nickname":"([^"]+)"/);
+        if (nicknameMatch?.[1] && isValidDisplayName(nicknameMatch[1], username)) {
+          displayName = nicknameMatch[1];
+        }
+      } catch {}
+    }
+
+    return {
+      avatarUrl: avatarUrl || null,
+      displayName: isValidDisplayName(displayName, username) ? displayName : null,
+    };
+  } catch (err) {
+    console.warn(`[${username}] profile fallback failed:`, err?.message || err);
     return {
       avatarUrl: null,
       displayName: null,
     };
   }
-
-  return {
-    avatarUrl: info.avatarUrl || null,
-    displayName: info.displayName || null,
-  };
 }
 
 async function hydrateProfile(state) {
@@ -1578,19 +1506,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!username || !isValidTikTokUsernameFormat(username)) {
+        if (!username) {
           await interaction.reply({
-            content:
-              "❌ Username TikTok tidak valid. Gunakan username saja, misalnya `olengbeachlive` tanpa @ dan tanpa spasi.",
-            ephemeral: true,
-          });
-          return;
-        }
-
-        const isValidTikTokUser = await validateTikTokUsername(username);
-        if (!isValidTikTokUser) {
-          await interaction.reply({
-            content: `❌ Username TikTok \`${username}\` tidak ditemukan. Pastikan username benar dan akun TikTok tersebut memang ada.`,
+            content: "❌ Username TikTok tidak valid.",
             ephemeral: true,
           });
           return;
@@ -1716,43 +1634,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
           interaction.fields.getTextInputValue("tiktok_username")
         );
 
-        if (!username || !isValidTikTokUsernameFormat(username)) {
+        if (!username) {
           await interaction.reply({
-            content:
-              "❌ Username TikTok tidak valid. Gunakan username saja, misalnya `olengbeachlive` tanpa @ dan tanpa spasi.",
+            content: "❌ Username TikTok tidak valid. Gunakan username, bukan nama profil.",
             ephemeral: true,
           });
           return;
         }
 
-        await interaction.deferReply({ ephemeral: true });
-
-        const profileInfo = await fetchTikTokProfileInfo(username);
-
-        if (!profileInfo.exists) {
-          await interaction.editReply({
-            content: `❌ Username TikTok \`${username}\` tidak ditemukan. Pastikan username benar dan akun TikTok tersebut memang ada.`,
-            embeds: [],
-            components: [],
-          });
-          return;
-        }
-
-        const previewEmbed = buildTermsEmbed(username);
-        if (profileInfo.displayName) {
-          previewEmbed.addFields({
-            name: "Nama Profil Terdeteksi",
-            value: profileInfo.displayName,
-            inline: true,
-          });
-        }
-        if (profileInfo.avatarUrl) {
-          previewEmbed.setThumbnail(profileInfo.avatarUrl);
-        }
-
-        await interaction.editReply({
-          content: `✅ Username TikTok \`${username}\` ditemukan. Silakan lanjutkan.`,
-          embeds: [previewEmbed],
+        await interaction.reply({
+          ephemeral: true,
+          embeds: [buildTermsEmbed(username)],
           components: buildTermsButtons(username, false),
         });
         return;
