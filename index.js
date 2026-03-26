@@ -56,6 +56,14 @@ const LIVE_BG_URL =
 // berapa kali poll offline berturut-turut sebelum dianggap benar-benar selesai
 const OFFLINE_CONFIRM_TICKS = Number(process.env.OFFLINE_CONFIRM_TICKS || 2);
 
+// live title wajib mengandung semua keyword ini supaya boleh di-broadcast
+const REQUIRED_LIVE_TITLE_KEYWORDS = String(
+  process.env.REQUIRED_LIVE_TITLE_KEYWORDS || "oleng beach"
+)
+  .split(" ")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!GUILD_ID) throw new Error("Missing GUILD_ID");
 if (!LIVE_ANNOUNCE_CHANNEL_ID) throw new Error("Missing LIVE_ANNOUNCE_CHANNEL_ID");
@@ -160,6 +168,48 @@ function normalizeImageUrl(url) {
   return finalUrl;
 }
 
+function normalizeSpace(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isGenericTikTokTitle(text) {
+  const value = normalizeSpace(text).toLowerCase();
+  return (
+    !value ||
+    value === "tiktok" ||
+    value === "tiktok - make your day" ||
+    value === "make your day" ||
+    value.startsWith("tiktok - make your day")
+  );
+}
+
+function isValidDisplayName(text, username = "") {
+  const value = normalizeSpace(text);
+  if (!value) return false;
+  if (isGenericTikTokTitle(value)) return false;
+  if (value.toLowerCase() === String(username || "").toLowerCase()) return false;
+  return true;
+}
+
+function cleanLiveTitle(text) {
+  const value = normalizeSpace(text);
+  if (!value) return null;
+  if (isGenericTikTokTitle(value)) return null;
+  return value;
+}
+
+function isAllowedLiveTitle(title) {
+  const normalized = normalizeSpace(title).toLowerCase();
+  if (!normalized) return false;
+  if (!REQUIRED_LIVE_TITLE_KEYWORDS.length) return true;
+
+  return REQUIRED_LIVE_TITLE_KEYWORDS.every((keyword) =>
+    normalized.includes(keyword)
+  );
+}
+
 async function fetchText(url) {
   const res = await fetch(url, {
     headers: {
@@ -259,19 +309,30 @@ function extractProfileFromAny(state, source) {
 
     const nextAvatar = normalizeImageUrl(extractUserLikeAvatar(user));
 
-    if (nextName) state.displayName = nextName;
-    if (nextAvatar) state.avatarUrl = nextAvatar;
+    if (isValidDisplayName(nextName, state.username)) {
+      state.displayName = nextName;
+    }
+    if (nextAvatar) {
+      state.avatarUrl = nextAvatar;
+    }
 
     if (state.displayName && state.avatarUrl) break;
   }
 
-  state.liveTitle =
+  const nextLiveTitle = cleanLiveTitle(
     pickFirstString(
       source?.title,
       source?.description,
       source?.roomInfo?.title,
-      source?.data?.title
-    ) || state.liveTitle;
+      source?.data?.title,
+      source?.owner?.roomTitle,
+      source?.user?.roomTitle
+    )
+  );
+
+  if (nextLiveTitle) {
+    state.liveTitle = nextLiveTitle;
+  }
 
   state.viewers =
     source?.stats?.userCount ??
@@ -280,6 +341,8 @@ function extractProfileFromAny(state, source) {
     source?.viewerCount ??
     source?.total ??
     state.viewers;
+
+  updateBroadcastEligibility(state);
 }
 
 async function fetchTikTokProfileFallback(username) {
@@ -289,7 +352,6 @@ async function fetchTikTokProfileFallback(username) {
     let avatarUrl = null;
     let displayName = null;
 
-    // og:image fallback
     const ogImageMatch = html.match(
       /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
     );
@@ -297,17 +359,6 @@ async function fetchTikTokProfileFallback(username) {
       avatarUrl = normalizeImageUrl(ogImageMatch[1]);
     }
 
-    // title/meta fallback
-    const titleMatch = html.match(/<title>(.*?)<\/title>/i);
-    if (titleMatch?.[1]) {
-      const raw = titleMatch[1].trim();
-      const cleaned = raw.split(" | ")[0]?.trim();
-      if (cleaned && !cleaned.startsWith("@")) {
-        displayName = cleaned;
-      }
-    }
-
-    // SIGI_STATE JSON
     const sigiMatch = html.match(
       /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application\/json">(.*?)<\/script>/s
     );
@@ -316,7 +367,6 @@ async function fetchTikTokProfileFallback(username) {
       try {
         const jsonText = sigiMatch[1];
         const data = JSON.parse(jsonText);
-
         const whole = JSON.stringify(data);
 
         const avatarCandidates = [
@@ -330,15 +380,15 @@ async function fetchTikTokProfileFallback(username) {
         avatarUrl = avatarUrl || avatarCandidates.find(Boolean) || null;
 
         const nicknameMatch = whole.match(/"nickname":"([^"]+)"/);
-        if (nicknameMatch?.[1]) {
-          displayName = displayName || nicknameMatch[1];
+        if (nicknameMatch?.[1] && isValidDisplayName(nicknameMatch[1], username)) {
+          displayName = nicknameMatch[1];
         }
       } catch {}
     }
 
     return {
       avatarUrl: avatarUrl || null,
-      displayName: displayName || null,
+      displayName: isValidDisplayName(displayName, username) ? displayName : null,
     };
   } catch (err) {
     console.warn(`[${username}] profile fallback failed:`, err?.message || err);
@@ -352,12 +402,18 @@ async function fetchTikTokProfileFallback(username) {
 async function hydrateProfile(state) {
   await fetchRoomData(state);
 
-  if (!state.avatarUrl || !state.displayName || state.displayName === state.username) {
+  if (!state.avatarUrl || !isValidDisplayName(state.displayName, state.username)) {
     const fallback = await fetchTikTokProfileFallback(state.username);
 
     if (fallback.displayName) state.displayName = fallback.displayName;
     if (fallback.avatarUrl) state.avatarUrl = fallback.avatarUrl;
   }
+
+  if (!isValidDisplayName(state.displayName, state.username)) {
+    state.displayName = state.username;
+  }
+
+  updateBroadcastEligibility(state);
 }
 
 async function safeLoadImage(url, width = 1280, height = 720, fallbackType = "bg") {
@@ -436,7 +492,7 @@ function drawCenteredText(ctx, text, x, y, options = {}) {
   ctx.restore();
 }
 
-async function createLiveBanner({ username, displayName, avatarUrl }) {
+async function createLiveBanner({ username, displayName, avatarUrl, liveTitle }) {
   const width = 1280;
   const height = 720;
   const canvas = createCanvas(width, height);
@@ -508,16 +564,25 @@ async function createLiveBanner({ username, displayName, avatarUrl }) {
   ctx.stroke();
   ctx.restore();
 
-  drawCenteredText(ctx, "LIVE NOW", width / 2, 468, {
-    font: `96px ${getFontFamily("bold")}`,
+  drawCenteredText(ctx, "LIVE NOW", width / 2, 460, {
+    font: `92px ${getFontFamily("bold")}`,
     fillStyle: "#ffffff",
     strokeStyle: "rgba(0,0,0,0.78)",
     lineWidth: 12,
   });
 
+  const safeTitle = sanitizeText(liveTitle || "Tanpa Judul Live", 52);
+  const titleFont = fitText(ctx, safeTitle, 980, 52, 22, "bold");
+  drawCenteredText(ctx, safeTitle, width / 2, 530, {
+    font: `${titleFont}px ${getFontFamily("bold")}`,
+    fillStyle: "#f8fafc",
+    strokeStyle: "rgba(0,0,0,0.78)",
+    lineWidth: 8,
+  });
+
   const safeDisplayName = sanitizeText(displayName || username, 32);
-  const nameFont = fitText(ctx, safeDisplayName, 900, 58, 22, "bold");
-  drawCenteredText(ctx, safeDisplayName, width / 2, 550, {
+  const nameFont = fitText(ctx, safeDisplayName, 900, 42, 20, "bold");
+  drawCenteredText(ctx, safeDisplayName, width / 2, 585, {
     font: `${nameFont}px ${getFontFamily("bold")}`,
     fillStyle: "#f8fafc",
     strokeStyle: "rgba(0,0,0,0.78)",
@@ -525,8 +590,8 @@ async function createLiveBanner({ username, displayName, avatarUrl }) {
   });
 
   const handle = `@${sanitizeText(username, 32)}`;
-  const handleFont = fitText(ctx, handle, 700, 34, 18, "regular");
-  drawCenteredText(ctx, handle, width / 2, 605, {
+  const handleFont = fitText(ctx, handle, 700, 30, 18, "regular");
+  drawCenteredText(ctx, handle, width / 2, 628, {
     font: `${handleFont}px ${getFontFamily("regular")}`,
     fillStyle: "rgba(255,255,255,0.95)",
     strokeStyle: "rgba(0,0,0,0.65)",
@@ -540,8 +605,8 @@ async function createLiveBanner({ username, displayName, avatarUrl }) {
   ctx.strokeStyle = lineGrad;
   ctx.lineWidth = 6;
   ctx.beginPath();
-  ctx.moveTo(width / 2 - 185, 640);
-  ctx.lineTo(width / 2 + 185, 640);
+  ctx.moveTo(width / 2 - 185, 655);
+  ctx.lineTo(width / 2 + 185, 655);
   ctx.stroke();
   ctx.restore();
 
@@ -550,13 +615,13 @@ async function createLiveBanner({ username, displayName, avatarUrl }) {
   ctx.textBaseline = "middle";
   ctx.font = `28px ${getFontFamily("regular")}`;
   ctx.fillStyle = "rgba(255,255,255,0.94)";
-  ctx.fillText("Jangan sampai ketinggalan live-nya!", width / 2, 680);
+  ctx.fillText("Jangan sampai ketinggalan live-nya!", width / 2, 688);
   ctx.restore();
 
   return canvas.encode("png");
 }
 
-async function createEndLiveBanner({ username, displayName, avatarUrl }) {
+async function createEndLiveBanner({ username, displayName, avatarUrl, liveTitle }) {
   const width = 1280;
   const height = 720;
   const canvas = createCanvas(width, height);
@@ -627,16 +692,25 @@ async function createEndLiveBanner({ username, displayName, avatarUrl }) {
   ctx.stroke();
   ctx.restore();
 
-  drawCenteredText(ctx, "LIVE ENDED", width / 2, 468, {
-    font: `90px ${getFontFamily("bold")}`,
+  drawCenteredText(ctx, "LIVE ENDED", width / 2, 460, {
+    font: `86px ${getFontFamily("bold")}`,
     fillStyle: "#ffffff",
     strokeStyle: "rgba(0,0,0,0.78)",
     lineWidth: 12,
   });
 
+  const safeTitle = sanitizeText(liveTitle || "Tanpa Judul Live", 52);
+  const titleFont = fitText(ctx, safeTitle, 980, 50, 22, "bold");
+  drawCenteredText(ctx, safeTitle, width / 2, 530, {
+    font: `${titleFont}px ${getFontFamily("bold")}`,
+    fillStyle: "#f8fafc",
+    strokeStyle: "rgba(0,0,0,0.78)",
+    lineWidth: 8,
+  });
+
   const safeDisplayName = sanitizeText(displayName || username, 32);
-  const nameFont = fitText(ctx, safeDisplayName, 900, 58, 22, "bold");
-  drawCenteredText(ctx, safeDisplayName, width / 2, 550, {
+  const nameFont = fitText(ctx, safeDisplayName, 900, 42, 20, "bold");
+  drawCenteredText(ctx, safeDisplayName, width / 2, 585, {
     font: `${nameFont}px ${getFontFamily("bold")}`,
     fillStyle: "#f8fafc",
     strokeStyle: "rgba(0,0,0,0.78)",
@@ -644,8 +718,8 @@ async function createEndLiveBanner({ username, displayName, avatarUrl }) {
   });
 
   const handle = `@${sanitizeText(username, 32)}`;
-  const handleFont = fitText(ctx, handle, 700, 34, 18, "regular");
-  drawCenteredText(ctx, handle, width / 2, 605, {
+  const handleFont = fitText(ctx, handle, 700, 30, 18, "regular");
+  drawCenteredText(ctx, handle, width / 2, 628, {
     font: `${handleFont}px ${getFontFamily("regular")}`,
     fillStyle: "rgba(255,255,255,0.92)",
     strokeStyle: "rgba(0,0,0,0.65)",
@@ -656,8 +730,8 @@ async function createEndLiveBanner({ username, displayName, avatarUrl }) {
   ctx.strokeStyle = "#9ca3af";
   ctx.lineWidth = 6;
   ctx.beginPath();
-  ctx.moveTo(width / 2 - 185, 640);
-  ctx.lineTo(width / 2 + 185, 640);
+  ctx.moveTo(width / 2 - 185, 655);
+  ctx.lineTo(width / 2 + 185, 655);
   ctx.stroke();
   ctx.restore();
 
@@ -666,7 +740,7 @@ async function createEndLiveBanner({ username, displayName, avatarUrl }) {
   ctx.textBaseline = "middle";
   ctx.font = `28px ${getFontFamily("regular")}`;
   ctx.fillStyle = "rgba(255,255,255,0.92)";
-  ctx.fillText("Live sudah selesai. Sampai jumpa di live berikutnya!", width / 2, 680);
+  ctx.fillText("Live sudah selesai. Sampai jumpa di live berikutnya!", width / 2, 688);
   ctx.restore();
 
   return canvas.encode("png");
@@ -696,6 +770,9 @@ function createState(username) {
     lastPollLive: false,
     offlineTicks: 0,
     activeSessionId: null,
+
+    shouldBroadcastLive: false,
+    hasBroadcastedLive: false,
   };
 
   bindTikTokEvents(state);
@@ -707,6 +784,10 @@ function getState(username) {
     liveStates.set(username, createState(username));
   }
   return liveStates.get(username);
+}
+
+function updateBroadcastEligibility(state) {
+  state.shouldBroadcastLive = isAllowedLiveTitle(state.liveTitle);
 }
 
 async function fetchRoomData(state) {
@@ -722,12 +803,13 @@ async function fetchRoomData(state) {
 
 function buildLiveEmbed(state) {
   const lines = [
-    `**Nama:** ${state.displayName || state.username}`,
+    `**Nama Profil:** ${state.displayName || state.username}`,
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
     state.viewers != null ? `**Viewer:** ${state.viewers}` : null,
+    state.liveTitle ? `**Judul Live:** ${state.liveTitle}` : `**Judul Live:** Tidak terdeteksi`,
     "",
-    state.liveTitle ? `**Judul Live:** ${state.liveTitle}` : "🔴 **Sedang LIVE sekarang**",
+    "🔴 **Sedang LIVE sekarang**",
     "",
     "Klik tombol di bawah untuk langsung masuk ke TikTok LIVE.",
   ].filter(Boolean);
@@ -749,9 +831,10 @@ function buildLiveEmbed(state) {
 
 function buildEndLiveEmbed(state) {
   const lines = [
-    `**Nama:** ${state.displayName || state.username}`,
+    `**Nama Profil:** ${state.displayName || state.username}`,
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
+    state.liveTitle ? `**Judul Live Terakhir:** ${state.liveTitle}` : null,
     "",
     "Live barusan sudah berakhir.",
   ].filter(Boolean);
@@ -817,10 +900,18 @@ async function sendLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
   await hydrateProfile(state);
 
+  if (!state.shouldBroadcastLive) {
+    console.log(
+      `[${state.username}] live skipped: title does not match filter -> ${state.liveTitle || "-"}`
+    );
+    return false;
+  }
+
   const bannerBuffer = await createLiveBanner({
     username: state.username,
     displayName: state.displayName || state.username,
     avatarUrl: state.avatarUrl,
+    liveTitle: state.liveTitle,
   });
 
   const bannerAttachment = new AttachmentBuilder(bannerBuffer, {
@@ -829,23 +920,33 @@ async function sendLiveAnnouncement(state) {
 
   await sendAndPublish(channel, {
     content: MENTION_EVERYONE
-      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!`
-      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!`,
+      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}`
+      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}`,
     files: [bannerAttachment],
     embeds: [buildLiveEmbed(state)],
     components: buildButtons(state),
     allowedMentions: MENTION_EVERYONE ? { parse: ["everyone"] } : {},
   });
+
+  return true;
 }
 
 async function sendEndLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
   await hydrateProfile(state);
 
+  if (!state.hasBroadcastedLive) {
+    console.log(
+      `[${state.username}] end skipped: session was never broadcasted`
+    );
+    return false;
+  }
+
   const bannerBuffer = await createEndLiveBanner({
     username: state.username,
     displayName: state.displayName || state.username,
     avatarUrl: state.avatarUrl,
+    liveTitle: state.liveTitle,
   });
 
   const bannerAttachment = new AttachmentBuilder(bannerBuffer, {
@@ -853,11 +954,13 @@ async function sendEndLiveAnnouncement(state) {
   });
 
   await sendAndPublish(channel, {
-    content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.`,
+    content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n**Judul terakhir:** ${state.liveTitle || "Tidak terdeteksi"}`,
     files: [bannerAttachment],
     embeds: [buildEndLiveEmbed(state)],
     components: buildButtons(state),
   });
+
+  return true;
 }
 
 function resetLiveFlagsAfterEnd(state) {
@@ -871,6 +974,8 @@ function resetLiveFlagsAfterEnd(state) {
   state.viewers = null;
   state.lastEndedAt = nowIso();
   state.activeSessionId = null;
+  state.shouldBroadcastLive = false;
+  state.hasBroadcastedLive = false;
 
   try {
     state.conn.disconnect();
@@ -879,11 +984,22 @@ function resetLiveFlagsAfterEnd(state) {
 
 async function announceLiveIfNeeded(state) {
   if (state.liveMessageSent) return;
+  await hydrateProfile(state);
+
+  if (!state.shouldBroadcastLive) {
+    console.log(
+      `[${state.username}] live not broadcasted because title doesn't contain required keywords. title="${state.liveTitle || "-"}"`
+    );
+    return;
+  }
 
   try {
-    await sendLiveAnnouncement(state);
+    const sent = await sendLiveAnnouncement(state);
+    if (!sent) return;
+
     state.liveMessageSent = true;
     state.announcedLive = true;
+    state.hasBroadcastedLive = true;
     console.log(`[${state.username}] live announcement sent`);
   } catch (err) {
     console.error(`[${state.username}] failed live announcement:`, err);
@@ -892,9 +1008,15 @@ async function announceLiveIfNeeded(state) {
 
 async function announceEndIfNeeded(state) {
   if (state.endAnnounced) return;
+  if (!state.hasBroadcastedLive) {
+    console.log(`[${state.username}] end not sent because live was not broadcasted`);
+    return;
+  }
 
   try {
-    await sendEndLiveAnnouncement(state);
+    const sent = await sendEndLiveAnnouncement(state);
+    if (!sent) return;
+
     state.endAnnounced = true;
     console.log(`[${state.username}] end announcement sent`);
   } catch (err) {
