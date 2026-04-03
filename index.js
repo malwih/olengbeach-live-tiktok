@@ -71,6 +71,14 @@ const REQUIRED_LIVE_TITLE_KEYWORDS = String(
   .map((x) => x.trim().toLowerCase())
   .filter(Boolean);
 
+// retry metadata biar live dari HP yang metadata-nya telat tetap kebaca
+const METADATA_RETRY_COUNT = Number(process.env.METADATA_RETRY_COUNT || 3);
+const METADATA_RETRY_DELAY_MS = Number(process.env.METADATA_RETRY_DELAY_MS || 2000);
+
+// debug payload
+const DEBUG_TIKTOK_RAW =
+  String(process.env.DEBUG_TIKTOK_RAW || "true").toLowerCase() === "true";
+
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!GUILD_ID) throw new Error("Missing GUILD_ID");
 if (!LIVE_ANNOUNCE_CHANNEL_ID) throw new Error("Missing LIVE_ANNOUNCE_CHANNEL_ID");
@@ -94,6 +102,10 @@ function fmtDateID(dateLike) {
   return new Date(dateLike).toLocaleString("id-ID", {
     timeZone: "Asia/Jakarta",
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getTikTokUrl(username) {
@@ -421,8 +433,46 @@ function extractUserLikeAvatar(userLike) {
   );
 }
 
+function debugSourceSnapshot(state, source, label = "SOURCE") {
+  if (!DEBUG_TIKTOK_RAW || !source) return;
+
+  try {
+    const snapshot = {
+      sourceKeys: Object.keys(source || {}),
+      title: source?.title,
+      description: source?.description,
+      desc: source?.desc,
+      roomInfoTitle: source?.roomInfo?.title,
+      roomInfoDescription: source?.roomInfo?.description,
+      roomInfoDesc: source?.roomInfo?.desc,
+      dataTitle: source?.data?.title,
+      dataDescription: source?.data?.description,
+      dataDesc: source?.data?.desc,
+      ownerRoomTitle: source?.owner?.roomTitle,
+      ownerDescription: source?.owner?.description,
+      userRoomTitle: source?.user?.roomTitle,
+      userDescription: source?.user?.description,
+      shareMetaTitle: source?.shareMeta?.title,
+      shareMetaDescription: source?.shareMeta?.description,
+      shareMetaDesc: source?.shareMeta?.desc,
+      liveRoomTitle: source?.liveRoom?.title,
+      liveRoomDescription: source?.liveRoom?.description,
+      liveRoomDesc: source?.liveRoom?.desc,
+      roomDataTitle: source?.roomData?.title,
+      roomDataDescription: source?.roomData?.description,
+      roomDataDesc: source?.roomData?.desc,
+    };
+
+    console.log(`[${state.username}] ${label}: ${JSON.stringify(snapshot, null, 2)}`);
+  } catch (err) {
+    console.warn(`[${state.username}] debugSourceSnapshot failed:`, err?.message || err);
+  }
+}
+
 function extractProfileFromAny(state, source) {
   if (!source) return;
+
+  debugSourceSnapshot(state, source, "RAW PAYLOAD");
 
   const possibleUsers = [
     source?.owner,
@@ -467,7 +517,15 @@ function extractProfileFromAny(state, source) {
       source?.roomInfo?.title,
       source?.data?.title,
       source?.owner?.roomTitle,
-      source?.user?.roomTitle
+      source?.user?.roomTitle,
+      source?.shareMeta?.title,
+      source?.shareMeta?.desc,
+      source?.liveRoom?.title,
+      source?.liveRoom?.description,
+      source?.liveRoom?.desc,
+      source?.roomData?.title,
+      source?.roomData?.description,
+      source?.roomData?.desc
     )
   );
 
@@ -480,7 +538,13 @@ function extractProfileFromAny(state, source) {
       source?.data?.description,
       source?.data?.desc,
       source?.owner?.description,
-      source?.user?.description
+      source?.user?.description,
+      source?.shareMeta?.description,
+      source?.shareMeta?.desc,
+      source?.liveRoom?.description,
+      source?.liveRoom?.desc,
+      source?.roomData?.description,
+      source?.roomData?.desc
     )
   );
 
@@ -501,6 +565,10 @@ function extractProfileFromAny(state, source) {
     state.viewers;
 
   updateBroadcastEligibility(state);
+
+  console.log(
+    `[${state.username}] metadata parsed -> title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}" allowed=${state.shouldBroadcastLive}`
+  );
 }
 
 async function fetchTikTokProfileFallback(username) {
@@ -572,6 +640,29 @@ async function hydrateProfile(state) {
   }
 
   updateBroadcastEligibility(state);
+}
+
+async function hydrateProfileWithRetry(state, retryCount = METADATA_RETRY_COUNT) {
+  for (let i = 0; i < retryCount; i++) {
+    await hydrateProfile(state);
+
+    if (state.shouldBroadcastLive) {
+      console.log(
+        `[${state.username}] metadata ready on attempt ${i + 1}/${retryCount}`
+      );
+      return true;
+    }
+
+    console.log(
+      `[${state.username}] metadata retry ${i + 1}/${retryCount} -> title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
+    );
+
+    if (i < retryCount - 1) {
+      await sleep(METADATA_RETRY_DELAY_MS);
+    }
+  }
+
+  return state.shouldBroadcastLive;
 }
 
 async function safeLoadImage(url, width = 1280, height = 720, fallbackType = "bg") {
@@ -1065,7 +1156,7 @@ async function sendAndPublish(channel, payload) {
 
 async function sendLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
-  await hydrateProfile(state);
+  await hydrateProfileWithRetry(state);
 
   if (!state.shouldBroadcastLive) {
     console.log(
@@ -1152,7 +1243,8 @@ function resetLiveFlagsAfterEnd(state) {
 
 async function announceLiveIfNeeded(state) {
   if (state.liveMessageSent) return;
-  await hydrateProfile(state);
+
+  await hydrateProfileWithRetry(state);
 
   if (!state.shouldBroadcastLive) {
     console.log(
@@ -1222,12 +1314,14 @@ function bindTikTokEvents(state) {
     state.isConnecting = false;
   });
 
-  conn.on(WebcastEvent.LIVE_INTRO, (msg) => {
+  conn.on(WebcastEvent.LIVE_INTRO, async (msg) => {
     extractProfileFromAny(state, msg);
+    await announceLiveIfNeeded(state);
   });
 
-  conn.on(WebcastEvent.ROOM_USER, (msg) => {
+  conn.on(WebcastEvent.ROOM_USER, async (msg) => {
     extractProfileFromAny(state, msg);
+    await announceLiveIfNeeded(state);
   });
 
   conn.on(WebcastEvent.STREAM_END, async ({ action }) => {
@@ -1256,7 +1350,7 @@ async function ensureLiveConnection(state) {
     state.lastPollLive = true;
     state.isLive = true;
 
-    await hydrateProfile(state);
+    await hydrateProfileWithRetry(state);
 
     try {
       await state.conn.connect();
@@ -1305,7 +1399,7 @@ async function handlePolledLive(state) {
   state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
   state.endAnnounced = false;
 
-  await hydrateProfile(state);
+  await hydrateProfileWithRetry(state);
   await announceLiveIfNeeded(state);
 
   if (!state.conn.getState || !state.conn.getState()?.isConnected) {
@@ -1709,6 +1803,9 @@ client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Monitoring: ${TIKTOK_USERNAMES.join(", ")}`);
   console.log(`STAFF_ROLE_ID: ${STAFF_ROLE_ID}`);
+  console.log(`METADATA_RETRY_COUNT: ${METADATA_RETRY_COUNT}`);
+  console.log(`METADATA_RETRY_DELAY_MS: ${METADATA_RETRY_DELAY_MS}`);
+  console.log(`DEBUG_TIKTOK_RAW: ${DEBUG_TIKTOK_RAW}`);
 
   try {
     await getAnnounceChannel();
