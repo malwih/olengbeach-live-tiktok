@@ -63,7 +63,7 @@ const LIVE_BG_URL =
 // berapa kali poll offline berturut-turut sebelum dianggap benar-benar selesai
 const OFFLINE_CONFIRM_TICKS = Number(process.env.OFFLINE_CONFIRM_TICKS || 2);
 
-// live title wajib mengandung semua keyword ini supaya boleh di-broadcast
+// keyword wajib ada di judul ATAU deskripsi supaya boleh di-broadcast
 const REQUIRED_LIVE_TITLE_KEYWORDS = String(
   process.env.REQUIRED_LIVE_TITLE_KEYWORDS || "oleng beach"
 )
@@ -217,8 +217,19 @@ function cleanLiveTitle(text) {
   return value;
 }
 
-function isAllowedLiveTitle(title) {
-  const normalized = normalizeSpace(title).toLowerCase();
+function cleanLiveDescription(text) {
+  const value = normalizeSpace(text);
+  if (!value) return null;
+  if (isGenericTikTokTitle(value)) return null;
+  return value;
+}
+
+function buildBroadcastCheckText(state) {
+  return normalizeSpace([state.liveTitle, state.liveDescription].filter(Boolean).join(" "));
+}
+
+function isAllowedBroadcastText(text) {
+  const normalized = normalizeSpace(text).toLowerCase();
   if (!normalized) return false;
   if (!REQUIRED_LIVE_TITLE_KEYWORDS.length) return true;
 
@@ -291,7 +302,7 @@ function buildTermsEmbed(username) {
         `**Username TikTok:** \`${username}\``,
         "",
         "**S&K Daftar TikTok Live Broadcast:**",
-        '1. Judul / Deskripsi live harus menggunakan kata **"OLENG BEACH"**. Jika tidak, maka live kamu tidak akan di broadcast.',
+        '1. Judul **atau** deskripsi live harus menggunakan kata **"OLENG BEACH"**. Jika tidak, maka live kamu tidak akan di broadcast.',
         "2. Gunakan **username TikTok**. Jika ada perubahan username, kalian wajib menghubungi Owner untuk di Update.",
         "3. Jaga nama baik Oleng Beach saat Live berlangsung. Apabila terindikasi atau laporan penyalahgunaan nama Oleng Beach maka akan di tindaklanjuti dengan tegas.",
         "",
@@ -453,7 +464,6 @@ function extractProfileFromAny(state, source) {
   const nextLiveTitle = cleanLiveTitle(
     pickFirstString(
       source?.title,
-      source?.description,
       source?.roomInfo?.title,
       source?.data?.title,
       source?.owner?.roomTitle,
@@ -461,8 +471,25 @@ function extractProfileFromAny(state, source) {
     )
   );
 
+  const nextLiveDescription = cleanLiveDescription(
+    pickFirstString(
+      source?.description,
+      source?.desc,
+      source?.roomInfo?.description,
+      source?.roomInfo?.desc,
+      source?.data?.description,
+      source?.data?.desc,
+      source?.owner?.description,
+      source?.user?.description
+    )
+  );
+
   if (nextLiveTitle) {
     state.liveTitle = nextLiveTitle;
+  }
+
+  if (nextLiveDescription) {
+    state.liveDescription = nextLiveDescription;
   }
 
   state.viewers =
@@ -896,6 +923,7 @@ function createState(username) {
     displayName: username,
     avatarUrl: null,
     liveTitle: null,
+    liveDescription: null,
     viewers: null,
 
     lastPollLive: false,
@@ -918,7 +946,7 @@ function getState(username) {
 }
 
 function updateBroadcastEligibility(state) {
-  state.shouldBroadcastLive = isAllowedLiveTitle(state.liveTitle);
+  state.shouldBroadcastLive = isAllowedBroadcastText(buildBroadcastCheckText(state));
 }
 
 async function fetchRoomData(state) {
@@ -939,6 +967,9 @@ function buildLiveEmbed(state) {
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
     state.viewers != null ? `**Viewer:** ${state.viewers}` : null,
     state.liveTitle ? `**Judul Live:** ${state.liveTitle}` : `**Judul Live:** Tidak terdeteksi`,
+    state.liveDescription
+      ? `**Deskripsi Live:** ${state.liveDescription}`
+      : `**Deskripsi Live:** Tidak terdeteksi`,
     "",
     "🔴 **Sedang LIVE sekarang**",
     "",
@@ -966,6 +997,7 @@ function buildEndLiveEmbed(state) {
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
     state.liveTitle ? `**Judul Live Terakhir:** ${state.liveTitle}` : null,
+    state.liveDescription ? `**Deskripsi Live Terakhir:** ${state.liveDescription}` : null,
     "",
     "Live barusan sudah berakhir.",
   ].filter(Boolean);
@@ -1037,7 +1069,7 @@ async function sendLiveAnnouncement(state) {
 
   if (!state.shouldBroadcastLive) {
     console.log(
-      `[${state.username}] live skipped: title does not match filter -> ${state.liveTitle || "-"}`
+      `[${state.username}] live skipped: title/description does not match filter -> title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
     );
     return false;
   }
@@ -1046,7 +1078,7 @@ async function sendLiveAnnouncement(state) {
     username: state.username,
     displayName: state.displayName || state.username,
     avatarUrl: state.avatarUrl,
-    liveTitle: state.liveTitle,
+    liveTitle: state.liveTitle || state.liveDescription || "Tanpa Judul Live",
   });
 
   const bannerAttachment = new AttachmentBuilder(bannerBuffer, {
@@ -1055,8 +1087,8 @@ async function sendLiveAnnouncement(state) {
 
   await sendAndPublish(channel, {
     content: MENTION_EVERYONE
-      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}`
-      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}`,
+      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`
+      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`,
     files: [bannerAttachment],
     embeds: [buildLiveEmbed(state)],
     components: buildButtons(state),
@@ -1081,7 +1113,7 @@ async function sendEndLiveAnnouncement(state) {
     username: state.username,
     displayName: state.displayName || state.username,
     avatarUrl: state.avatarUrl,
-    liveTitle: state.liveTitle,
+    liveTitle: state.liveTitle || state.liveDescription || "Tanpa Judul Live",
   });
 
   const bannerAttachment = new AttachmentBuilder(bannerBuffer, {
@@ -1089,7 +1121,7 @@ async function sendEndLiveAnnouncement(state) {
   });
 
   await sendAndPublish(channel, {
-    content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n**Judul terakhir:** ${state.liveTitle || "Tidak terdeteksi"}`,
+    content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n**Judul terakhir:** ${state.liveTitle || "Tidak terdeteksi"}\n**Deskripsi terakhir:** ${state.liveDescription || "Tidak terdeteksi"}`,
     files: [bannerAttachment],
     embeds: [buildEndLiveEmbed(state)],
     components: buildButtons(state),
@@ -1106,6 +1138,7 @@ function resetLiveFlagsAfterEnd(state) {
   state.endAnnounced = false;
   state.roomId = null;
   state.liveTitle = null;
+  state.liveDescription = null;
   state.viewers = null;
   state.lastEndedAt = nowIso();
   state.activeSessionId = null;
@@ -1123,7 +1156,7 @@ async function announceLiveIfNeeded(state) {
 
   if (!state.shouldBroadcastLive) {
     console.log(
-      `[${state.username}] live not broadcasted because title doesn't contain required keywords. title="${state.liveTitle || "-"}"`
+      `[${state.username}] live not broadcasted because title/description doesn't contain required keywords. title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
     );
     return;
   }
