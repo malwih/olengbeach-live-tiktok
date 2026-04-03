@@ -104,6 +104,27 @@ function fmtDateID(dateLike) {
   });
 }
 
+function fmtNumber(num) {
+  if (num == null) return "0";
+  return new Intl.NumberFormat("id-ID").format(Number(num) || 0);
+}
+
+function fmtDuration(start, end) {
+  if (!start || !end) return "-";
+
+  const ms = new Date(end) - new Date(start);
+  if (Number.isNaN(ms) || ms < 0) return "-";
+
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return [hours, minutes, seconds]
+    .map((v) => String(v).padStart(2, "0"))
+    .join(":");
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -556,13 +577,7 @@ function extractProfileFromAny(state, source) {
     state.liveDescription = nextLiveDescription;
   }
 
-  state.viewers =
-    source?.stats?.userCount ??
-    source?.stats?.viewerCount ??
-    source?.stats?.totalUser ??
-    source?.viewerCount ??
-    source?.total ??
-    state.viewers;
+  updateLiveMetrics(state, source);
 
   updateBroadcastEligibility(state);
 
@@ -1017,6 +1032,13 @@ function createState(username) {
   liveTitle: null,
   liveDescription: null,
   viewers: null,
+  likes: 0,
+  diamonds: 0,
+  sessionStartAt: null,
+  sessionEndAt: null,
+  peakViewers: 0,
+  lastKnownViewers: 0,
+  totalLikes: 0,
 
   lastPollLive: false,
   offlineTicks: 0,
@@ -1039,6 +1061,58 @@ function getState(username) {
 
 function updateBroadcastEligibility(state) {
   state.shouldBroadcastLive = isAllowedBroadcastText(buildBroadcastCheckText(state));
+}
+
+function updateLiveMetrics(state, source) {
+  if (!source) return;
+
+  const viewersNow =
+    source?.stats?.userCount ??
+    source?.stats?.viewerCount ??
+    source?.stats?.totalUser ??
+    source?.viewerCount ??
+    source?.total ??
+    source?.roomInfo?.stats?.userCount ??
+    null;
+
+  const likesNow =
+    source?.stats?.likeCount ??
+    source?.stats?.totalLikeCount ??
+    source?.likeCount ??
+    source?.totalLikeCount ??
+    source?.roomInfo?.stats?.likeCount ??
+    null;
+
+  const diamondsNow =
+    source?.stats?.diamondCount ??
+    source?.diamondCount ??
+    source?.roomInfo?.stats?.diamondCount ??
+    null;
+
+  if (viewersNow != null) {
+    state.viewers = viewersNow;
+    state.lastKnownViewers = viewersNow;
+    state.peakViewers = Math.max(state.peakViewers || 0, viewersNow);
+  }
+
+  if (likesNow != null) {
+    state.likes = likesNow;
+    state.totalLikes = Math.max(state.totalLikes || 0, likesNow);
+  }
+
+  if (diamondsNow != null) {
+    state.diamonds = diamondsNow;
+  }
+}
+
+function resetSessionMetrics(state) {
+  state.sessionStartAt = nowIso();
+  state.sessionEndAt = null;
+  state.peakViewers = 0;
+  state.lastKnownViewers = 0;
+  state.likes = 0;
+  state.totalLikes = 0;
+  state.diamonds = 0;
 }
 
 async function fetchRoomData(state) {
@@ -1090,6 +1164,15 @@ function buildEndLiveEmbed(state) {
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
     state.liveTitle ? `**Judul Live Terakhir:** ${state.liveTitle}` : null,
     state.liveDescription ? `**Deskripsi Live Terakhir:** ${state.liveDescription}` : null,
+    "",
+    "📊 **Rekap Hasil Live**",
+    `**Mulai Live:** ${state.sessionStartAt ? fmtDateID(state.sessionStartAt) + " WIB" : "-"}`,
+    `**Selesai Live:** ${state.sessionEndAt ? fmtDateID(state.sessionEndAt) + " WIB" : "-"}`,
+    `**Durasi Live:** ${fmtDuration(state.sessionStartAt, state.sessionEndAt)}`,
+    `**Viewer Terakhir:** ${fmtNumber(state.lastKnownViewers)}`,
+    `**Peak Viewer:** ${fmtNumber(state.peakViewers)}`,
+    `**Total Like:** ${fmtNumber(state.totalLikes)}`,
+    `**Diamond:** ${fmtNumber(state.diamonds)}`,
     "",
     "Live barusan sudah berakhir.",
   ].filter(Boolean);
@@ -1193,6 +1276,7 @@ async function sendLiveAnnouncement(state) {
 async function sendEndLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
   await hydrateProfile(state);
+    state.sessionEndAt = state.sessionEndAt || nowIso();
 
   if (!state.hasBroadcastedLive) {
     console.log(
@@ -1213,7 +1297,16 @@ async function sendEndLiveAnnouncement(state) {
   });
 
   await sendAndPublish(channel, {
-    content: `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n**Judul terakhir:** ${state.liveTitle || "Tidak terdeteksi"}\n**Deskripsi terakhir:** ${state.liveDescription || "Tidak terdeteksi"}`,
+    content:
+  `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n` +
+  `**Judul terakhir:** ${state.liveTitle || "Tidak terdeteksi"}\n` +
+  `**Deskripsi terakhir:** ${state.liveDescription || "Tidak terdeteksi"}\n\n` +
+  `📊 **Rekap Live**\n` +
+  `• Durasi: ${fmtDuration(state.sessionStartAt, state.sessionEndAt)}\n` +
+  `• Viewer terakhir: ${fmtNumber(state.lastKnownViewers)}\n` +
+  `• Peak viewer: ${fmtNumber(state.peakViewers)}\n` +
+  `• Total like: ${fmtNumber(state.totalLikes)}\n` +
+  `• Diamond: ${fmtNumber(state.diamonds)}`,
     files: [bannerAttachment],
     embeds: [buildEndLiveEmbed(state)],
     components: buildButtons(state),
@@ -1233,6 +1326,13 @@ function resetLiveFlagsAfterEnd(state) {
   state.liveTitle = null;
   state.liveDescription = null;
   state.viewers = null;
+  state.likes = 0;
+  state.diamonds = 0;
+  state.sessionStartAt = null;
+  state.sessionEndAt = null;
+  state.peakViewers = 0;
+  state.lastKnownViewers = 0;
+  state.totalLikes = 0;
   state.lastEndedAt = nowIso();
   state.activeSessionId = null;
   state.shouldBroadcastLive = false;
@@ -1301,6 +1401,9 @@ function bindTikTokEvents(state) {
     state.roomId = connState?.roomId || state.roomId;
     state.lastLiveAt = state.lastLiveAt || nowIso();
     state.activeSessionId = state.activeSessionId || `${username}:${Date.now()}`;
+        if (!state.sessionStartAt) {
+      resetSessionMetrics(state);
+    }
     state.endAnnounced = false;
 
     extractProfileFromAny(state, connState);
@@ -1330,8 +1433,25 @@ function bindTikTokEvents(state) {
     await announceLiveIfNeeded(state);
   });
 
+    conn.on(WebcastEvent.LIKE, async (msg) => {
+    updateLiveMetrics(state, msg);
+  });
+
+  conn.on(WebcastEvent.SOCIAL, async (msg) => {
+    updateLiveMetrics(state, msg);
+  });
+
+  conn.on(WebcastEvent.GIFT, async (msg) => {
+    updateLiveMetrics(state, msg);
+  });
+
+  conn.on(WebcastEvent.ROOM_STATS, async (msg) => {
+    updateLiveMetrics(state, msg);
+  });
+
   conn.on(WebcastEvent.STREAM_END, async ({ action }) => {
     console.log(`[${username}] STREAM_END action=${action}`);
+        state.sessionEndAt = nowIso();
     await announceEndIfNeeded(state);
     resetLiveFlagsAfterEnd(state);
   });
@@ -1352,6 +1472,9 @@ async function ensureLiveConnection(state) {
 
     state.lastLiveAt = state.lastLiveAt || nowIso();
     state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
+      if (!state.sessionStartAt) {
+    resetSessionMetrics(state);
+  }
     state.offlineTicks = 0;
     state.lastPollLive = true;
     state.isLive = true;
@@ -1393,6 +1516,7 @@ async function handlePolledOffline(state) {
   }
 
   console.log(`[${state.username}] confirmed offline, sending end announcement`);
+    state.sessionEndAt = nowIso();
   await announceEndIfNeeded(state);
   resetLiveFlagsAfterEnd(state);
 }
