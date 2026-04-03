@@ -999,31 +999,32 @@ function createState(username) {
   const conn = new TikTokLiveConnection(username);
 
   const state = {
-    username,
-    conn,
+  username,
+  conn,
 
-    isLive: false,
-    isConnecting: false,
-    announcedLive: false,
-    endAnnounced: false,
-    liveMessageSent: false,
-    roomId: null,
-    lastLiveAt: null,
-    lastEndedAt: null,
+  isLive: false,
+  isConnecting: false,
+  announcedLive: false,
+  endAnnounced: false,
+  liveMessageSent: false,
+  isSendingLiveAnnouncement: false,
+  roomId: null,
+  lastLiveAt: null,
+  lastEndedAt: null,
 
-    displayName: username,
-    avatarUrl: null,
-    liveTitle: null,
-    liveDescription: null,
-    viewers: null,
+  displayName: username,
+  avatarUrl: null,
+  liveTitle: null,
+  liveDescription: null,
+  viewers: null,
 
-    lastPollLive: false,
-    offlineTicks: 0,
-    activeSessionId: null,
+  lastPollLive: false,
+  offlineTicks: 0,
+  activeSessionId: null,
 
-    shouldBroadcastLive: false,
-    hasBroadcastedLive: false,
-  };
+  shouldBroadcastLive: false,
+  hasBroadcastedLive: false,
+};
 
   bindTikTokEvents(state);
   return state;
@@ -1226,6 +1227,7 @@ function resetLiveFlagsAfterEnd(state) {
   state.isConnecting = false;
   state.announcedLive = false;
   state.liveMessageSent = false;
+  state.isSendingLiveAnnouncement = false;
   state.endAnnounced = false;
   state.roomId = null;
   state.liveTitle = null;
@@ -1242,18 +1244,20 @@ function resetLiveFlagsAfterEnd(state) {
 }
 
 async function announceLiveIfNeeded(state) {
-  if (state.liveMessageSent) return;
+  if (state.liveMessageSent || state.isSendingLiveAnnouncement) return;
 
-  await hydrateProfileWithRetry(state);
-
-  if (!state.shouldBroadcastLive) {
-    console.log(
-      `[${state.username}] live not broadcasted because title/description doesn't contain required keywords. title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
-    );
-    return;
-  }
+  state.isSendingLiveAnnouncement = true;
 
   try {
+    await hydrateProfileWithRetry(state);
+
+    if (!state.shouldBroadcastLive) {
+      console.log(
+        `[${state.username}] live not broadcasted because title/description doesn't contain required keywords. title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
+      );
+      return;
+    }
+
     const sent = await sendLiveAnnouncement(state);
     if (!sent) return;
 
@@ -1263,6 +1267,8 @@ async function announceLiveIfNeeded(state) {
     console.log(`[${state.username}] live announcement sent`);
   } catch (err) {
     console.error(`[${state.username}] failed live announcement:`, err);
+  } finally {
+    state.isSendingLiveAnnouncement = false;
   }
 }
 
