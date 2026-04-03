@@ -532,42 +532,36 @@ function extractProfileFromAny(state, source) {
     if (state.displayName && state.avatarUrl) break;
   }
 
-  const nextLiveTitle = cleanLiveTitle(
-    pickFirstString(
-      source?.title,
-      source?.roomInfo?.title,
-      source?.data?.title,
-      source?.owner?.roomTitle,
-      source?.user?.roomTitle,
-      source?.shareMeta?.title,
-      source?.shareMeta?.desc,
-      source?.liveRoom?.title,
-      source?.liveRoom?.description,
-      source?.liveRoom?.desc,
-      source?.roomData?.title,
-      source?.roomData?.description,
-      source?.roomData?.desc
-    )
-  );
+  const rawLiveTitle = pickFirstString(
+  source?.title,
+  source?.roomInfo?.title,
+  source?.data?.title,
+  source?.owner?.roomTitle,
+  source?.user?.roomTitle,
+  source?.shareMeta?.title,
+  source?.liveRoom?.title,
+  source?.roomData?.title
+);
 
-  const nextLiveDescription = cleanLiveDescription(
-    pickFirstString(
-      source?.description,
-      source?.desc,
-      source?.roomInfo?.description,
-      source?.roomInfo?.desc,
-      source?.data?.description,
-      source?.data?.desc,
-      source?.owner?.description,
-      source?.user?.description,
-      source?.shareMeta?.description,
-      source?.shareMeta?.desc,
-      source?.liveRoom?.description,
-      source?.liveRoom?.desc,
-      source?.roomData?.description,
-      source?.roomData?.desc
-    )
-  );
+const rawLiveDescription = pickFirstString(
+  source?.description,
+  source?.desc,
+  source?.roomInfo?.description,
+  source?.roomInfo?.desc,
+  source?.data?.description,
+  source?.data?.desc,
+  source?.owner?.description,
+  source?.user?.description,
+  source?.shareMeta?.description,
+  source?.shareMeta?.desc,
+  source?.liveRoom?.description,
+  source?.liveRoom?.desc,
+  source?.roomData?.description,
+  source?.roomData?.desc
+);
+
+const nextLiveTitle = cleanLiveTitle(rawLiveTitle) || cleanLiveTitle(rawLiveDescription);
+const nextLiveDescription = cleanLiveDescription(rawLiveDescription);
 
   if (nextLiveTitle) {
     state.liveTitle = nextLiveTitle;
@@ -1132,7 +1126,9 @@ function buildLiveEmbed(state) {
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
     state.viewers != null ? `**Viewer:** ${state.viewers}` : null,
-    state.liveTitle ? `**Judul Live:** ${state.liveTitle}` : `**Judul Live:** Tidak terdeteksi`,
+    state.liveTitle || state.liveDescription
+  ? `**Judul Live:** ${state.liveTitle || state.liveDescription}`
+  : `**Judul Live:** Tidak terdeteksi`,
     state.liveDescription
       ? `**Deskripsi Live:** ${state.liveDescription}`
       : `**Deskripsi Live:** Tidak terdeteksi`,
@@ -1162,7 +1158,9 @@ function buildEndLiveEmbed(state) {
     `**Nama Profil:** ${state.displayName || state.username}`,
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
-    state.liveTitle ? `**Judul Live Terakhir:** ${state.liveTitle}` : null,
+    state.liveTitle || state.liveDescription
+  ? `**Judul Live Terakhir:** ${state.liveTitle || state.liveDescription}`
+  : null,
     state.liveDescription ? `**Deskripsi Live Terakhir:** ${state.liveDescription}` : null,
     "",
     "📊 **Rekap Hasil Live**",
@@ -1262,8 +1260,8 @@ async function sendLiveAnnouncement(state) {
 
   await sendAndPublish(channel, {
     content: MENTION_EVERYONE
-      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`
-      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`,
+      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || state.liveDescription || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`
+      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || state.liveDescription || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`,
     files: [bannerAttachment],
     embeds: [buildLiveEmbed(state)],
     components: buildButtons(state),
@@ -1299,7 +1297,7 @@ async function sendEndLiveAnnouncement(state) {
   await sendAndPublish(channel, {
     content:
   `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n` +
-  `**Judul terakhir:** ${state.liveTitle || "Tidak terdeteksi"}\n` +
+  `**Judul terakhir:** ${state.liveTitle || state.liveDescription || "Tidak terdeteksi"}\n` +
   `**Deskripsi terakhir:** ${state.liveDescription || "Tidak terdeteksi"}\n\n` +
   `📊 **Rekap Live**\n` +
   `• Durasi: ${fmtDuration(state.sessionStartAt, state.sessionEndAt)}\n` +
@@ -1374,10 +1372,18 @@ async function announceLiveIfNeeded(state) {
 
 async function announceEndIfNeeded(state) {
   if (state.endAnnounced) return;
-  if (!state.hasBroadcastedLive) {
-    console.log(`[${state.username}] end not sent because live was not broadcasted`);
-    return;
-  }
+
+const canSendEndAnnouncement =
+  state.hasBroadcastedLive ||
+  !!state.activeSessionId ||
+  !!state.sessionStartAt ||
+  state.liveMessageSent ||
+  state.announcedLive;
+
+if (!canSendEndAnnouncement) {
+  console.log(`[${state.username}] end not sent because no active live session was recorded`);
+  return;
+}
 
   try {
     const sent = await sendEndLiveAnnouncement(state);
@@ -1527,6 +1533,9 @@ async function handlePolledLive(state) {
   state.isLive = true;
   state.lastLiveAt = state.lastLiveAt || nowIso();
   state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
+  if (!state.sessionStartAt) {
+  resetSessionMetrics(state);
+}
   state.endAnnounced = false;
 
   await hydrateProfileWithRetry(state);
