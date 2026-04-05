@@ -72,6 +72,17 @@ const LIVE_BG_URL =
   process.env.LIVE_BG_URL ||
   "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1600&auto=format&fit=crop";
 
+/**
+ * Tetap pakai keyword filter.
+ * Pisahkan dengan koma.
+ * Contoh:
+ * REQUIRED_LIVE_KEYWORDS=oleng beach,ob beach,event oleng
+ */
+const REQUIRED_LIVE_KEYWORDS = String(process.env.REQUIRED_LIVE_KEYWORDS || "oleng beach")
+  .split(",")
+  .map((x) => x.trim().toLowerCase())
+  .filter(Boolean);
+
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!GUILD_ID) throw new Error("Missing GUILD_ID");
 if (!LIVE_ANNOUNCE_CHANNEL_ID) throw new Error("Missing LIVE_ANNOUNCE_CHANNEL_ID");
@@ -231,6 +242,13 @@ function isGenericTikTokTitle(text) {
   );
 }
 
+function cleanLiveText(text) {
+  const value = normalizeSpace(text);
+  if (!value) return null;
+  if (isGenericTikTokTitle(value)) return null;
+  return value;
+}
+
 function isValidDisplayName(text, username = "") {
   const value = normalizeSpace(text);
   if (!value) return false;
@@ -241,6 +259,22 @@ function isValidDisplayName(text, username = "") {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildKeywordCheckText(state) {
+  return normalizeSpace(
+    [state.liveTitle, state.liveDescription, state.lastSeenLiveText]
+      .filter(Boolean)
+      .join(" ")
+  ).toLowerCase();
+}
+
+function matchesRequiredKeyword(state) {
+  const text = buildKeywordCheckText(state);
+  if (!text) return false;
+  if (!REQUIRED_LIVE_KEYWORDS.length) return true;
+
+  return REQUIRED_LIVE_KEYWORDS.some((keyword) => text.includes(keyword));
 }
 
 /* =========================================================
@@ -315,10 +349,10 @@ function buildTermsEmbed(username) {
         `**Username TikTok:** \`${username}\``,
         "",
         "**S&K Daftar TikTok Live Broadcast:**",
-        "1. Broadcast hanya berjalan saat akun sedang live.",
-        "2. Pesan broadcast tidak menampilkan judul/deskripsi live.",
-        "3. Gunakan **username TikTok**. Jika ada perubahan username, wajib hubungi Owner untuk update.",
-        "4. Jaga nama baik server saat live berlangsung.",
+        `1. Broadcast hanya berjalan saat akun live dan mengandung keyword yang diizinkan.`,
+        `2. Keyword aktif saat ini: ${REQUIRED_LIVE_KEYWORDS.map((x) => `\`${x}\``).join(", ") || "-"}`,
+        "3. Pesan broadcast tidak menampilkan judul/deskripsi live.",
+        "4. Gunakan **username TikTok**. Jika ada perubahan username, wajib hubungi Owner untuk update.",
         "",
         "Silakan klik **Saya Setuju**, lalu klik **Submit**.",
       ].join("\n")
@@ -447,8 +481,14 @@ function debugSourceSnapshot(state, source, label = "SOURCE") {
       desc: source?.desc,
       roomInfoTitle: source?.roomInfo?.title,
       roomInfoDescription: source?.roomInfo?.description,
+      roomInfoDesc: source?.roomInfo?.desc,
       dataTitle: source?.data?.title,
       dataDescription: source?.data?.description,
+      dataDesc: source?.data?.desc,
+      shareMetaTitle: source?.shareMeta?.title,
+      shareMetaDescription: source?.shareMeta?.description,
+      liveRoomTitle: source?.liveRoom?.title,
+      liveRoomDescription: source?.liveRoom?.description,
       ownerNickname: source?.owner?.nickname,
       userNickname: source?.user?.nickname,
     };
@@ -457,6 +497,41 @@ function debugSourceSnapshot(state, source, label = "SOURCE") {
   } catch (err) {
     console.warn(`[${state.username}] debugSourceSnapshot failed:`, err?.message || err);
   }
+}
+
+function extractLiveTextsFromSource(source) {
+  const rawTitle = pickFirstString(
+    source?.title,
+    source?.roomInfo?.title,
+    source?.data?.title,
+    source?.owner?.roomTitle,
+    source?.user?.roomTitle,
+    source?.shareMeta?.title,
+    source?.liveRoom?.title,
+    source?.roomData?.title
+  );
+
+  const rawDescription = pickFirstString(
+    source?.description,
+    source?.desc,
+    source?.roomInfo?.description,
+    source?.roomInfo?.desc,
+    source?.data?.description,
+    source?.data?.desc,
+    source?.owner?.description,
+    source?.user?.description,
+    source?.shareMeta?.description,
+    source?.shareMeta?.desc,
+    source?.liveRoom?.description,
+    source?.liveRoom?.desc,
+    source?.roomData?.description,
+    source?.roomData?.desc
+  );
+
+  return {
+    liveTitle: cleanLiveText(rawTitle),
+    liveDescription: cleanLiveText(rawDescription),
+  };
 }
 
 function extractProfileFromAny(state, source) {
@@ -502,6 +577,16 @@ function extractProfileFromAny(state, source) {
     if (state.displayName && state.avatarUrl) break;
   }
 
+  const texts = extractLiveTextsFromSource(source);
+
+  if (texts.liveTitle) state.liveTitle = texts.liveTitle;
+  if (texts.liveDescription) state.liveDescription = texts.liveDescription;
+
+  const combined = normalizeSpace([texts.liveTitle, texts.liveDescription].filter(Boolean).join(" "));
+  if (combined) {
+    state.lastSeenLiveText = combined;
+  }
+
   updateLiveMetrics(state, source);
 }
 
@@ -542,9 +627,7 @@ async function fetchTikTokProfileFallback(username) {
         if (nicknameMatch?.[1] && isValidDisplayName(nicknameMatch[1], username)) {
           displayName = nicknameMatch[1];
         }
-      } catch {
-        // noop
-      }
+      } catch {}
     }
 
     return {
@@ -923,6 +1006,10 @@ function createState(username) {
     displayName: username,
     avatarUrl: null,
 
+    liveTitle: null,
+    liveDescription: null,
+    lastSeenLiveText: null,
+
     viewers: null,
     likes: 0,
     diamonds: 0,
@@ -1190,6 +1277,10 @@ function resetLiveFlagsAfterEnd(state) {
   state.likes = 0;
   state.diamonds = 0;
 
+  state.liveTitle = null;
+  state.liveDescription = null;
+  state.lastSeenLiveText = null;
+
   state.sessionStartAt = null;
   state.sessionEndAt = null;
   state.peakViewers = 0;
@@ -1202,13 +1293,18 @@ function resetLiveFlagsAfterEnd(state) {
 
   try {
     state.conn.disconnect();
-  } catch {
-    // noop
-  }
+  } catch {}
 }
 
 async function announceLiveIfNeeded(state) {
   if (state.liveMessageSent || state.isSendingLiveAnnouncement) return;
+
+  if (!matchesRequiredKeyword(state)) {
+    console.log(
+      `[${state.username}] skip broadcast: keyword not matched | title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}" text="${state.lastSeenLiveText || "-"}"`
+    );
+    return;
+  }
 
   state.isSendingLiveAnnouncement = true;
 
@@ -1489,9 +1585,7 @@ async function lockTicketForUser(channel, requesterId) {
 async function closeTicketChannel(channel, reason = "Closed") {
   try {
     await channel.send(`🔒 Ticket akan ditutup. Alasan: **${reason}**`);
-  } catch {
-    // noop
-  }
+  } catch {}
 
   setTimeout(async () => {
     try {
@@ -1583,9 +1677,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setStyle(TextInputStyle.Short)
           .setMaxLength(50);
 
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(usernameInput)
-        );
+        modal.addComponents(new ActionRowBuilder().addComponents(usernameInput));
 
         await interaction.showModal(modal);
         return;
@@ -1783,9 +1875,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ephemeral: true,
           });
         }
-      } catch {
-        // noop
-      }
+      } catch {}
     }
   }
 });
@@ -1801,6 +1891,7 @@ client.once("clientReady", async () => {
   console.log(`OFFLINE_CONFIRM_TICKS: ${OFFLINE_CONFIRM_TICKS}`);
   console.log(`CONNECT_COOLDOWN_MS: ${CONNECT_COOLDOWN_MS}`);
   console.log(`PROFILE_REFRESH_COOLDOWN_MS: ${PROFILE_REFRESH_COOLDOWN_MS}`);
+  console.log(`REQUIRED_LIVE_KEYWORDS: ${REQUIRED_LIVE_KEYWORDS.join(", ") || "-"}`);
   console.log(`DEBUG_TIKTOK_RAW: ${DEBUG_TIKTOK_RAW}`);
 
   try {
