@@ -23,11 +23,12 @@ import {
 } from "tiktok-live-connector";
 import { createCanvas, loadImage, GlobalFonts } from "@napi-rs/canvas";
 
-// ========= PATH =========
+/* =========================================================
+   PATH + FONT
+========================================================= */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ========= REGISTER FONTS =========
 const regularFontPath = path.join(__dirname, "assets/fonts/Poppins-Regular.ttf");
 const boldFontPath = path.join(__dirname, "assets/fonts/Poppins-Bold.ttf");
 
@@ -39,7 +40,9 @@ try {
   console.warn("Font register skipped:", e?.message || e);
 }
 
-// ========= CONFIG =========
+/* =========================================================
+   ENV
+========================================================= */
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const LIVE_ANNOUNCE_CHANNEL_ID = process.env.LIVE_ANNOUNCE_CHANNEL_ID;
@@ -51,33 +54,23 @@ const TIKTOK_USERNAMES = String(process.env.TIKTOK_USERNAMES || "")
   .map((x) => x.trim().replace(/^@/, ""))
   .filter(Boolean);
 
-const CHECK_INTERVAL_SECONDS = Number(process.env.CHECK_INTERVAL_SECONDS || 10);
+const POLL_INTERVAL_SECONDS = Number(process.env.POLL_INTERVAL_SECONDS || 90);
+const OFFLINE_CONFIRM_TICKS = Number(process.env.OFFLINE_CONFIRM_TICKS || 2);
+const CONNECT_COOLDOWN_MS = Number(process.env.CONNECT_COOLDOWN_MS || 10 * 60 * 1000);
+const PROFILE_REFRESH_COOLDOWN_MS = Number(
+  process.env.PROFILE_REFRESH_COOLDOWN_MS || 30 * 60 * 1000
+);
+
 const MENTION_EVERYONE =
   String(process.env.MENTION_EVERYONE || "true").toLowerCase() === "true";
+
+const DEBUG_TIKTOK_RAW =
+  String(process.env.DEBUG_TIKTOK_RAW || "false").toLowerCase() === "true";
 
 const SERVER_NAME = process.env.SERVER_NAME || "OLENG BEACH";
 const LIVE_BG_URL =
   process.env.LIVE_BG_URL ||
   "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=1600&auto=format&fit=crop";
-
-// berapa kali poll offline berturut-turut sebelum dianggap benar-benar selesai
-const OFFLINE_CONFIRM_TICKS = Number(process.env.OFFLINE_CONFIRM_TICKS || 2);
-
-// keyword wajib ada di judul ATAU deskripsi supaya boleh di-broadcast
-const REQUIRED_LIVE_TITLE_KEYWORDS = String(
-  process.env.REQUIRED_LIVE_TITLE_KEYWORDS || "oleng beach"
-)
-  .split(" ")
-  .map((x) => x.trim().toLowerCase())
-  .filter(Boolean);
-
-// retry metadata biar live dari HP yang metadata-nya telat tetap kebaca
-const METADATA_RETRY_COUNT = Number(process.env.METADATA_RETRY_COUNT || 3);
-const METADATA_RETRY_DELAY_MS = Number(process.env.METADATA_RETRY_DELAY_MS || 2000);
-
-// debug payload
-const DEBUG_TIKTOK_RAW =
-  String(process.env.DEBUG_TIKTOK_RAW || "true").toLowerCase() === "true";
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!GUILD_ID) throw new Error("Missing GUILD_ID");
@@ -86,14 +79,21 @@ if (!TIKTOK_USERNAMES.length) throw new Error("Missing TIKTOK_USERNAMES");
 if (!TIKTOK_TICKET_CATEGORY_ID) throw new Error("Missing TIKTOK_TICKET_CATEGORY_ID");
 if (!STAFF_ROLE_ID) throw new Error("Missing STAFF_ROLE_ID");
 
-// ========= CLIENT =========
+/* =========================================================
+   DISCORD CLIENT
+========================================================= */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
-// ========= STATE =========
+/* =========================================================
+   GLOBAL STATE
+========================================================= */
 const liveStates = new Map();
 
+/* =========================================================
+   HELPERS
+========================================================= */
 function nowIso() {
   return new Date().toISOString();
 }
@@ -123,10 +123,6 @@ function fmtDuration(start, end) {
   return [hours, minutes, seconds]
     .map((v) => String(v).padStart(2, "0"))
     .join(":");
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function getTikTokUrl(username) {
@@ -243,34 +239,13 @@ function isValidDisplayName(text, username = "") {
   return true;
 }
 
-function cleanLiveTitle(text) {
-  const value = normalizeSpace(text);
-  if (!value) return null;
-  if (isGenericTikTokTitle(value)) return null;
-  return value;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function cleanLiveDescription(text) {
-  const value = normalizeSpace(text);
-  if (!value) return null;
-  if (isGenericTikTokTitle(value)) return null;
-  return value;
-}
-
-function buildBroadcastCheckText(state) {
-  return normalizeSpace([state.liveTitle, state.liveDescription].filter(Boolean).join(" "));
-}
-
-function isAllowedBroadcastText(text) {
-  const normalized = normalizeSpace(text).toLowerCase();
-  if (!normalized) return false;
-  if (!REQUIRED_LIVE_TITLE_KEYWORDS.length) return true;
-
-  return REQUIRED_LIVE_TITLE_KEYWORDS.every((keyword) =>
-    normalized.includes(keyword)
-  );
-}
-
+/* =========================================================
+   TICKET META
+========================================================= */
 function buildTicketChannelName(username, userId) {
   const safeUsername =
     normalizeUsername(username).replace(/[^a-z0-9._-]/g, "").slice(0, 40) || "unknown";
@@ -286,7 +261,10 @@ function parseTicketMeta(channelTopic = "") {
     doneAt: null,
   };
 
-  const chunks = String(channelTopic || "").split("|").map((x) => x.trim());
+  const chunks = String(channelTopic || "")
+    .split("|")
+    .map((x) => x.trim());
+
   for (const part of chunks) {
     const [key, ...rest] = part.split("=");
     if (!key) continue;
@@ -313,7 +291,6 @@ function memberHasStaffRole(member) {
 
 function canUseDoneButton(member, channel) {
   if (!member || !channel) return false;
-
   if (memberHasStaffRole(member)) return true;
 
   const perms = channel.permissionsFor(member);
@@ -326,6 +303,9 @@ function canUseDoneButton(member, channel) {
   );
 }
 
+/* =========================================================
+   TERMS / BUTTONS
+========================================================= */
 function buildTermsEmbed(username) {
   return new EmbedBuilder()
     .setColor(0xfe2c55)
@@ -335,9 +315,10 @@ function buildTermsEmbed(username) {
         `**Username TikTok:** \`${username}\``,
         "",
         "**S&K Daftar TikTok Live Broadcast:**",
-        '1. Judul **atau** deskripsi live harus menggunakan kata **"OLENG BEACH"**. Jika tidak, maka live kamu tidak akan di broadcast.',
-        "2. Gunakan **username TikTok**. Jika ada perubahan username, kalian wajib menghubungi Owner untuk di Update.",
-        "3. Jaga nama baik Oleng Beach saat Live berlangsung. Apabila terindikasi atau laporan penyalahgunaan nama Oleng Beach maka akan di tindaklanjuti dengan tegas.",
+        "1. Broadcast hanya berjalan saat akun sedang live.",
+        "2. Pesan broadcast tidak menampilkan judul/deskripsi live.",
+        "3. Gunakan **username TikTok**. Jika ada perubahan username, wajib hubungi Owner untuk update.",
+        "4. Jaga nama baik server saat live berlangsung.",
         "",
         "Silakan klik **Saya Setuju**, lalu klik **Submit**.",
       ].join("\n")
@@ -385,6 +366,9 @@ function buildTicketButtons(username, isDone = false) {
   ];
 }
 
+/* =========================================================
+   HTTP / PROFILE FALLBACK
+========================================================= */
 async function fetchText(url) {
   const res = await fetch(url, {
     headers: {
@@ -424,9 +408,7 @@ async function fetchImageBuffer(url) {
     },
   });
 
-  if (!res.ok) {
-    throw new Error(`Image request failed with status ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`Image request failed with status ${res.status}`);
 
   const ab = await res.arrayBuffer();
   return Buffer.from(ab);
@@ -465,23 +447,10 @@ function debugSourceSnapshot(state, source, label = "SOURCE") {
       desc: source?.desc,
       roomInfoTitle: source?.roomInfo?.title,
       roomInfoDescription: source?.roomInfo?.description,
-      roomInfoDesc: source?.roomInfo?.desc,
       dataTitle: source?.data?.title,
       dataDescription: source?.data?.description,
-      dataDesc: source?.data?.desc,
-      ownerRoomTitle: source?.owner?.roomTitle,
-      ownerDescription: source?.owner?.description,
-      userRoomTitle: source?.user?.roomTitle,
-      userDescription: source?.user?.description,
-      shareMetaTitle: source?.shareMeta?.title,
-      shareMetaDescription: source?.shareMeta?.description,
-      shareMetaDesc: source?.shareMeta?.desc,
-      liveRoomTitle: source?.liveRoom?.title,
-      liveRoomDescription: source?.liveRoom?.description,
-      liveRoomDesc: source?.liveRoom?.desc,
-      roomDataTitle: source?.roomData?.title,
-      roomDataDescription: source?.roomData?.description,
-      roomDataDesc: source?.roomData?.desc,
+      ownerNickname: source?.owner?.nickname,
+      userNickname: source?.user?.nickname,
     };
 
     console.log(`[${state.username}] ${label}: ${JSON.stringify(snapshot, null, 2)}`);
@@ -525,6 +494,7 @@ function extractProfileFromAny(state, source) {
     if (isValidDisplayName(nextName, state.username)) {
       state.displayName = nextName;
     }
+
     if (nextAvatar) {
       state.avatarUrl = nextAvatar;
     }
@@ -532,52 +502,7 @@ function extractProfileFromAny(state, source) {
     if (state.displayName && state.avatarUrl) break;
   }
 
-  const rawLiveTitle = pickFirstString(
-  source?.title,
-  source?.roomInfo?.title,
-  source?.data?.title,
-  source?.owner?.roomTitle,
-  source?.user?.roomTitle,
-  source?.shareMeta?.title,
-  source?.liveRoom?.title,
-  source?.roomData?.title
-);
-
-const rawLiveDescription = pickFirstString(
-  source?.description,
-  source?.desc,
-  source?.roomInfo?.description,
-  source?.roomInfo?.desc,
-  source?.data?.description,
-  source?.data?.desc,
-  source?.owner?.description,
-  source?.user?.description,
-  source?.shareMeta?.description,
-  source?.shareMeta?.desc,
-  source?.liveRoom?.description,
-  source?.liveRoom?.desc,
-  source?.roomData?.description,
-  source?.roomData?.desc
-);
-
-const nextLiveTitle = cleanLiveTitle(rawLiveTitle) || cleanLiveTitle(rawLiveDescription);
-const nextLiveDescription = cleanLiveDescription(rawLiveDescription);
-
-  if (nextLiveTitle) {
-    state.liveTitle = nextLiveTitle;
-  }
-
-  if (nextLiveDescription) {
-    state.liveDescription = nextLiveDescription;
-  }
-
   updateLiveMetrics(state, source);
-
-  updateBroadcastEligibility(state);
-
-  console.log(
-    `[${state.username}] metadata parsed -> title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}" allowed=${state.shouldBroadcastLive}`
-  );
 }
 
 async function fetchTikTokProfileFallback(username) {
@@ -600,8 +525,7 @@ async function fetchTikTokProfileFallback(username) {
 
     if (sigiMatch?.[1]) {
       try {
-        const jsonText = sigiMatch[1];
-        const data = JSON.parse(jsonText);
+        const data = JSON.parse(sigiMatch[1]);
         const whole = JSON.stringify(data);
 
         const avatarCandidates = [
@@ -618,7 +542,9 @@ async function fetchTikTokProfileFallback(username) {
         if (nicknameMatch?.[1] && isValidDisplayName(nicknameMatch[1], username)) {
           displayName = nicknameMatch[1];
         }
-      } catch {}
+      } catch {
+        // noop
+      }
     }
 
     return {
@@ -634,46 +560,31 @@ async function fetchTikTokProfileFallback(username) {
   }
 }
 
-async function hydrateProfile(state) {
-  await fetchRoomData(state);
+async function refreshProfileIfNeeded(state, force = false) {
+  const now = Date.now();
 
-  if (!state.avatarUrl || !isValidDisplayName(state.displayName, state.username)) {
-    const fallback = await fetchTikTokProfileFallback(state.username);
-
-    if (fallback.displayName) state.displayName = fallback.displayName;
-    if (fallback.avatarUrl) state.avatarUrl = fallback.avatarUrl;
+  if (
+    !force &&
+    state.lastProfileRefreshAt &&
+    now - state.lastProfileRefreshAt < PROFILE_REFRESH_COOLDOWN_MS
+  ) {
+    return;
   }
+
+  state.lastProfileRefreshAt = now;
+
+  const fallback = await fetchTikTokProfileFallback(state.username);
+  if (fallback.displayName) state.displayName = fallback.displayName;
+  if (fallback.avatarUrl) state.avatarUrl = fallback.avatarUrl;
 
   if (!isValidDisplayName(state.displayName, state.username)) {
     state.displayName = state.username;
   }
-
-  updateBroadcastEligibility(state);
 }
 
-async function hydrateProfileWithRetry(state, retryCount = METADATA_RETRY_COUNT) {
-  for (let i = 0; i < retryCount; i++) {
-    await hydrateProfile(state);
-
-    if (state.shouldBroadcastLive) {
-      console.log(
-        `[${state.username}] metadata ready on attempt ${i + 1}/${retryCount}`
-      );
-      return true;
-    }
-
-    console.log(
-      `[${state.username}] metadata retry ${i + 1}/${retryCount} -> title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
-    );
-
-    if (i < retryCount - 1) {
-      await sleep(METADATA_RETRY_DELAY_MS);
-    }
-  }
-
-  return state.shouldBroadcastLive;
-}
-
+/* =========================================================
+   IMAGE HELPERS
+========================================================= */
 async function safeLoadImage(url, width = 1280, height = 720, fallbackType = "bg") {
   try {
     if (!url) throw new Error("Empty image url");
@@ -750,7 +661,7 @@ function drawCenteredText(ctx, text, x, y, options = {}) {
   ctx.restore();
 }
 
-async function createLiveBanner({ username, displayName, avatarUrl, liveTitle }) {
+async function createLiveBanner({ username, displayName, avatarUrl }) {
   const width = 1280;
   const height = 720;
   const canvas = createCanvas(width, height);
@@ -822,25 +733,16 @@ async function createLiveBanner({ username, displayName, avatarUrl, liveTitle })
   ctx.stroke();
   ctx.restore();
 
-  drawCenteredText(ctx, "LIVE NOW", width / 2, 460, {
+  drawCenteredText(ctx, "LIVE NOW", width / 2, 470, {
     font: `92px ${getFontFamily("bold")}`,
     fillStyle: "#ffffff",
     strokeStyle: "rgba(0,0,0,0.78)",
     lineWidth: 12,
   });
 
-  const safeTitle = sanitizeText(liveTitle || "Tanpa Judul Live", 52);
-  const titleFont = fitText(ctx, safeTitle, 980, 52, 22, "bold");
-  drawCenteredText(ctx, safeTitle, width / 2, 530, {
-    font: `${titleFont}px ${getFontFamily("bold")}`,
-    fillStyle: "#f8fafc",
-    strokeStyle: "rgba(0,0,0,0.78)",
-    lineWidth: 8,
-  });
-
   const safeDisplayName = sanitizeText(displayName || username, 32);
-  const nameFont = fitText(ctx, safeDisplayName, 900, 42, 20, "bold");
-  drawCenteredText(ctx, safeDisplayName, width / 2, 585, {
+  const nameFont = fitText(ctx, safeDisplayName, 900, 54, 20, "bold");
+  drawCenteredText(ctx, safeDisplayName, width / 2, 555, {
     font: `${nameFont}px ${getFontFamily("bold")}`,
     fillStyle: "#f8fafc",
     strokeStyle: "rgba(0,0,0,0.78)",
@@ -848,8 +750,8 @@ async function createLiveBanner({ username, displayName, avatarUrl, liveTitle })
   });
 
   const handle = `@${sanitizeText(username, 32)}`;
-  const handleFont = fitText(ctx, handle, 700, 30, 18, "regular");
-  drawCenteredText(ctx, handle, width / 2, 628, {
+  const handleFont = fitText(ctx, handle, 700, 32, 18, "regular");
+  drawCenteredText(ctx, handle, width / 2, 610, {
     font: `${handleFont}px ${getFontFamily("regular")}`,
     fillStyle: "rgba(255,255,255,0.95)",
     strokeStyle: "rgba(0,0,0,0.65)",
@@ -863,8 +765,8 @@ async function createLiveBanner({ username, displayName, avatarUrl, liveTitle })
   ctx.strokeStyle = lineGrad;
   ctx.lineWidth = 6;
   ctx.beginPath();
-  ctx.moveTo(width / 2 - 185, 655);
-  ctx.lineTo(width / 2 + 185, 655);
+  ctx.moveTo(width / 2 - 185, 650);
+  ctx.lineTo(width / 2 + 185, 650);
   ctx.stroke();
   ctx.restore();
 
@@ -873,13 +775,13 @@ async function createLiveBanner({ username, displayName, avatarUrl, liveTitle })
   ctx.textBaseline = "middle";
   ctx.font = `28px ${getFontFamily("regular")}`;
   ctx.fillStyle = "rgba(255,255,255,0.94)";
-  ctx.fillText("Jangan sampai ketinggalan live-nya!", width / 2, 688);
+  ctx.fillText("Jangan sampai ketinggalan live-nya!", width / 2, 686);
   ctx.restore();
 
   return canvas.encode("png");
 }
 
-async function createEndLiveBanner({ username, displayName, avatarUrl, liveTitle }) {
+async function createEndLiveBanner({ username, displayName, avatarUrl }) {
   const width = 1280;
   const height = 720;
   const canvas = createCanvas(width, height);
@@ -950,25 +852,16 @@ async function createEndLiveBanner({ username, displayName, avatarUrl, liveTitle
   ctx.stroke();
   ctx.restore();
 
-  drawCenteredText(ctx, "LIVE ENDED", width / 2, 460, {
+  drawCenteredText(ctx, "LIVE ENDED", width / 2, 470, {
     font: `86px ${getFontFamily("bold")}`,
     fillStyle: "#ffffff",
     strokeStyle: "rgba(0,0,0,0.78)",
     lineWidth: 12,
   });
 
-  const safeTitle = sanitizeText(liveTitle || "Tanpa Judul Live", 52);
-  const titleFont = fitText(ctx, safeTitle, 980, 50, 22, "bold");
-  drawCenteredText(ctx, safeTitle, width / 2, 530, {
-    font: `${titleFont}px ${getFontFamily("bold")}`,
-    fillStyle: "#f8fafc",
-    strokeStyle: "rgba(0,0,0,0.78)",
-    lineWidth: 8,
-  });
-
   const safeDisplayName = sanitizeText(displayName || username, 32);
-  const nameFont = fitText(ctx, safeDisplayName, 900, 42, 20, "bold");
-  drawCenteredText(ctx, safeDisplayName, width / 2, 585, {
+  const nameFont = fitText(ctx, safeDisplayName, 900, 54, 20, "bold");
+  drawCenteredText(ctx, safeDisplayName, width / 2, 555, {
     font: `${nameFont}px ${getFontFamily("bold")}`,
     fillStyle: "#f8fafc",
     strokeStyle: "rgba(0,0,0,0.78)",
@@ -976,8 +869,8 @@ async function createEndLiveBanner({ username, displayName, avatarUrl, liveTitle
   });
 
   const handle = `@${sanitizeText(username, 32)}`;
-  const handleFont = fitText(ctx, handle, 700, 30, 18, "regular");
-  drawCenteredText(ctx, handle, width / 2, 628, {
+  const handleFont = fitText(ctx, handle, 700, 32, 18, "regular");
+  drawCenteredText(ctx, handle, width / 2, 610, {
     font: `${handleFont}px ${getFontFamily("regular")}`,
     fillStyle: "rgba(255,255,255,0.92)",
     strokeStyle: "rgba(0,0,0,0.65)",
@@ -988,8 +881,8 @@ async function createEndLiveBanner({ username, displayName, avatarUrl, liveTitle
   ctx.strokeStyle = "#9ca3af";
   ctx.lineWidth = 6;
   ctx.beginPath();
-  ctx.moveTo(width / 2 - 185, 655);
-  ctx.lineTo(width / 2 + 185, 655);
+  ctx.moveTo(width / 2 - 185, 650);
+  ctx.lineTo(width / 2 + 185, 650);
   ctx.stroke();
   ctx.restore();
 
@@ -998,49 +891,52 @@ async function createEndLiveBanner({ username, displayName, avatarUrl, liveTitle
   ctx.textBaseline = "middle";
   ctx.font = `28px ${getFontFamily("regular")}`;
   ctx.fillStyle = "rgba(255,255,255,0.92)";
-  ctx.fillText("Live sudah selesai. Sampai jumpa di live berikutnya!", width / 2, 688);
+  ctx.fillText("Live sudah selesai. Sampai jumpa di live berikutnya!", width / 2, 686);
   ctx.restore();
 
   return canvas.encode("png");
 }
 
+/* =========================================================
+   STATE
+========================================================= */
 function createState(username) {
   const conn = new TikTokLiveConnection(username);
 
   const state = {
-  username,
-  conn,
+    username,
+    conn,
 
-  isLive: false,
-  isConnecting: false,
-  announcedLive: false,
-  endAnnounced: false,
-  liveMessageSent: false,
-  isSendingLiveAnnouncement: false,
-  roomId: null,
-  lastLiveAt: null,
-  lastEndedAt: null,
+    isLive: false,
+    isConnecting: false,
+    announcedLive: false,
+    endAnnounced: false,
+    liveMessageSent: false,
+    isSendingLiveAnnouncement: false,
 
-  displayName: username,
-  avatarUrl: null,
-  liveTitle: null,
-  liveDescription: null,
-  viewers: null,
-  likes: 0,
-  diamonds: 0,
-  sessionStartAt: null,
-  sessionEndAt: null,
-  peakViewers: 0,
-  lastKnownViewers: 0,
-  totalLikes: 0,
+    roomId: null,
+    lastLiveAt: null,
+    lastEndedAt: null,
+    lastProfileRefreshAt: 0,
+    lastConnectAttemptAt: 0,
 
-  lastPollLive: false,
-  offlineTicks: 0,
-  activeSessionId: null,
+    displayName: username,
+    avatarUrl: null,
 
-  shouldBroadcastLive: false,
-  hasBroadcastedLive: false,
-};
+    viewers: null,
+    likes: 0,
+    diamonds: 0,
+
+    sessionStartAt: null,
+    sessionEndAt: null,
+    peakViewers: 0,
+    lastKnownViewers: 0,
+    totalLikes: 0,
+
+    lastPollLive: false,
+    offlineTicks: 0,
+    activeSessionId: null,
+  };
 
   bindTikTokEvents(state);
   return state;
@@ -1053,8 +949,14 @@ function getState(username) {
   return liveStates.get(username);
 }
 
-function updateBroadcastEligibility(state) {
-  state.shouldBroadcastLive = isAllowedBroadcastText(buildBroadcastCheckText(state));
+function resetSessionMetrics(state) {
+  state.sessionStartAt = nowIso();
+  state.sessionEndAt = null;
+  state.peakViewers = 0;
+  state.lastKnownViewers = 0;
+  state.likes = 0;
+  state.totalLikes = 0;
+  state.diamonds = 0;
 }
 
 function updateLiveMetrics(state, source) {
@@ -1099,39 +1001,15 @@ function updateLiveMetrics(state, source) {
   }
 }
 
-function resetSessionMetrics(state) {
-  state.sessionStartAt = nowIso();
-  state.sessionEndAt = null;
-  state.peakViewers = 0;
-  state.lastKnownViewers = 0;
-  state.likes = 0;
-  state.totalLikes = 0;
-  state.diamonds = 0;
-}
-
-async function fetchRoomData(state) {
-  try {
-    const roomInfo = await state.conn.fetchRoomInfo();
-    extractProfileFromAny(state, roomInfo);
-    return roomInfo;
-  } catch (err) {
-    console.warn(`[${state.username}] fetchRoomInfo failed:`, err?.message || err);
-    return null;
-  }
-}
-
+/* =========================================================
+   DISCORD MESSAGE BUILDERS
+========================================================= */
 function buildLiveEmbed(state) {
   const lines = [
     `**Nama Profil:** ${state.displayName || state.username}`,
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
-    state.viewers != null ? `**Viewer:** ${state.viewers}` : null,
-    state.liveTitle || state.liveDescription
-  ? `**Judul Live:** ${state.liveTitle || state.liveDescription}`
-  : `**Judul Live:** Tidak terdeteksi`,
-    state.liveDescription
-      ? `**Deskripsi Live:** ${state.liveDescription}`
-      : `**Deskripsi Live:** Tidak terdeteksi`,
+    state.viewers != null ? `**Viewer:** ${fmtNumber(state.viewers)}` : null,
     "",
     "🔴 **Sedang LIVE sekarang**",
     "",
@@ -1158,14 +1036,10 @@ function buildEndLiveEmbed(state) {
     `**Nama Profil:** ${state.displayName || state.username}`,
     `**Username:** [@${state.username}](${getTikTokUrl(state.username)})`,
     state.roomId ? `**Room ID:** \`${state.roomId}\`` : null,
-    state.liveTitle || state.liveDescription
-  ? `**Judul Live Terakhir:** ${state.liveTitle || state.liveDescription}`
-  : null,
-    state.liveDescription ? `**Deskripsi Live Terakhir:** ${state.liveDescription}` : null,
     "",
     "📊 **Rekap Hasil Live**",
-    `**Mulai Live:** ${state.sessionStartAt ? fmtDateID(state.sessionStartAt) + " WIB" : "-"}`,
-    `**Selesai Live:** ${state.sessionEndAt ? fmtDateID(state.sessionEndAt) + " WIB" : "-"}`,
+    `**Mulai Live:** ${state.sessionStartAt ? `${fmtDateID(state.sessionStartAt)} WIB` : "-"}`,
+    `**Selesai Live:** ${state.sessionEndAt ? `${fmtDateID(state.sessionEndAt)} WIB` : "-"}`,
     `**Durasi Live:** ${fmtDuration(state.sessionStartAt, state.sessionEndAt)}`,
     `**Viewer Terakhir:** ${fmtNumber(state.lastKnownViewers)}`,
     `**Peak Viewer:** ${fmtNumber(state.peakViewers)}`,
@@ -1205,6 +1079,9 @@ function buildButtons(state) {
   ];
 }
 
+/* =========================================================
+   ANNOUNCE CHANNEL
+========================================================= */
 async function getAnnounceChannel() {
   const guild = await client.guilds.fetch(GUILD_ID);
   const channel = await guild.channels.fetch(LIVE_ANNOUNCE_CHANNEL_ID);
@@ -1236,32 +1113,28 @@ async function sendAndPublish(channel, payload) {
   return message;
 }
 
+/* =========================================================
+   ANNOUNCEMENTS
+========================================================= */
 async function sendLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
-  await hydrateProfileWithRetry(state);
 
-  if (!state.shouldBroadcastLive) {
-    console.log(
-      `[${state.username}] live skipped: title/description does not match filter -> title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
-    );
-    return false;
-  }
+  await refreshProfileIfNeeded(state, true);
 
   const bannerBuffer = await createLiveBanner({
     username: state.username,
     displayName: state.displayName || state.username,
     avatarUrl: state.avatarUrl,
-    liveTitle: state.liveTitle || state.liveDescription || "Tanpa Judul Live",
   });
 
   const bannerAttachment = new AttachmentBuilder(bannerBuffer, {
     name: `tiktok-live-${state.username}-${Date.now()}.png`,
   });
 
+  const intro = `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!`;
+
   await sendAndPublish(channel, {
-    content: MENTION_EVERYONE
-      ? `🚨 @everyone\n🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || state.liveDescription || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`
-      : `🔴 **${state.displayName || state.username}** sedang LIVE di TikTok!\n**Judul:** ${state.liveTitle || state.liveDescription || "Tidak terdeteksi"}\n**Deskripsi:** ${state.liveDescription || "Tidak terdeteksi"}`,
+    content: MENTION_EVERYONE ? `🚨 @everyone\n${intro}` : intro,
     files: [bannerAttachment],
     embeds: [buildLiveEmbed(state)],
     components: buildButtons(state),
@@ -1273,21 +1146,14 @@ async function sendLiveAnnouncement(state) {
 
 async function sendEndLiveAnnouncement(state) {
   const channel = await getAnnounceChannel();
-  await hydrateProfile(state);
-    state.sessionEndAt = state.sessionEndAt || nowIso();
 
-  if (!state.hasBroadcastedLive) {
-    console.log(
-      `[${state.username}] end skipped: session was never broadcasted`
-    );
-    return false;
-  }
+  await refreshProfileIfNeeded(state, false);
+  state.sessionEndAt = state.sessionEndAt || nowIso();
 
   const bannerBuffer = await createEndLiveBanner({
     username: state.username,
     displayName: state.displayName || state.username,
     avatarUrl: state.avatarUrl,
-    liveTitle: state.liveTitle || state.liveDescription || "Tanpa Judul Live",
   });
 
   const bannerAttachment = new AttachmentBuilder(bannerBuffer, {
@@ -1296,15 +1162,13 @@ async function sendEndLiveAnnouncement(state) {
 
   await sendAndPublish(channel, {
     content:
-  `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n` +
-  `**Judul terakhir:** ${state.liveTitle || state.liveDescription || "Tidak terdeteksi"}\n` +
-  `**Deskripsi terakhir:** ${state.liveDescription || "Tidak terdeteksi"}\n\n` +
-  `📊 **Rekap Live**\n` +
-  `• Durasi: ${fmtDuration(state.sessionStartAt, state.sessionEndAt)}\n` +
-  `• Viewer terakhir: ${fmtNumber(state.lastKnownViewers)}\n` +
-  `• Peak viewer: ${fmtNumber(state.peakViewers)}\n` +
-  `• Total like: ${fmtNumber(state.totalLikes)}\n` +
-  `• Diamond: ${fmtNumber(state.diamonds)}`,
+      `⏹️ **${state.displayName || state.username}** sudah selesai LIVE di TikTok.\n\n` +
+      `📊 **Rekap Live**\n` +
+      `• Durasi: ${fmtDuration(state.sessionStartAt, state.sessionEndAt)}\n` +
+      `• Viewer terakhir: ${fmtNumber(state.lastKnownViewers)}\n` +
+      `• Peak viewer: ${fmtNumber(state.peakViewers)}\n` +
+      `• Total like: ${fmtNumber(state.totalLikes)}\n` +
+      `• Diamond: ${fmtNumber(state.diamonds)}`,
     files: [bannerAttachment],
     embeds: [buildEndLiveEmbed(state)],
     components: buildButtons(state),
@@ -1320,25 +1184,27 @@ function resetLiveFlagsAfterEnd(state) {
   state.liveMessageSent = false;
   state.isSendingLiveAnnouncement = false;
   state.endAnnounced = false;
+
   state.roomId = null;
-  state.liveTitle = null;
-  state.liveDescription = null;
   state.viewers = null;
   state.likes = 0;
   state.diamonds = 0;
+
   state.sessionStartAt = null;
   state.sessionEndAt = null;
   state.peakViewers = 0;
   state.lastKnownViewers = 0;
   state.totalLikes = 0;
+
   state.lastEndedAt = nowIso();
   state.activeSessionId = null;
-  state.shouldBroadcastLive = false;
-  state.hasBroadcastedLive = false;
+  state.offlineTicks = 0;
 
   try {
     state.conn.disconnect();
-  } catch {}
+  } catch {
+    // noop
+  }
 }
 
 async function announceLiveIfNeeded(state) {
@@ -1347,21 +1213,11 @@ async function announceLiveIfNeeded(state) {
   state.isSendingLiveAnnouncement = true;
 
   try {
-    await hydrateProfileWithRetry(state);
-
-    if (!state.shouldBroadcastLive) {
-      console.log(
-        `[${state.username}] live not broadcasted because title/description doesn't contain required keywords. title="${state.liveTitle || "-"}" desc="${state.liveDescription || "-"}"`
-      );
-      return;
-    }
-
     const sent = await sendLiveAnnouncement(state);
     if (!sent) return;
 
     state.liveMessageSent = true;
     state.announcedLive = true;
-    state.hasBroadcastedLive = true;
     console.log(`[${state.username}] live announcement sent`);
   } catch (err) {
     console.error(`[${state.username}] failed live announcement:`, err);
@@ -1373,17 +1229,13 @@ async function announceLiveIfNeeded(state) {
 async function announceEndIfNeeded(state) {
   if (state.endAnnounced) return;
 
-const canSendEndAnnouncement =
-  state.hasBroadcastedLive ||
-  !!state.activeSessionId ||
-  !!state.sessionStartAt ||
-  state.liveMessageSent ||
-  state.announcedLive;
+  const canSendEndAnnouncement =
+    state.liveMessageSent || state.announcedLive || !!state.activeSessionId || !!state.sessionStartAt;
 
-if (!canSendEndAnnouncement) {
-  console.log(`[${state.username}] end not sent because no active live session was recorded`);
-  return;
-}
+  if (!canSendEndAnnouncement) {
+    console.log(`[${state.username}] end not sent because no active live session was recorded`);
+    return;
+  }
 
   try {
     const sent = await sendEndLiveAnnouncement(state);
@@ -1396,6 +1248,9 @@ if (!canSendEndAnnouncement) {
   }
 }
 
+/* =========================================================
+   TIKTOK EVENTS
+========================================================= */
 function bindTikTokEvents(state) {
   const { conn, username } = state;
 
@@ -1407,14 +1262,16 @@ function bindTikTokEvents(state) {
     state.roomId = connState?.roomId || state.roomId;
     state.lastLiveAt = state.lastLiveAt || nowIso();
     state.activeSessionId = state.activeSessionId || `${username}:${Date.now()}`;
-        if (!state.sessionStartAt) {
+
+    if (!state.sessionStartAt) {
       resetSessionMetrics(state);
     }
+
     state.endAnnounced = false;
 
     extractProfileFromAny(state, connState);
 
-    console.log(`[${username}] CONNECTED roomId=${state.roomId}`);
+    console.log(`[${username}] CONNECTED roomId=${state.roomId || "-"}`);
 
     await announceLiveIfNeeded(state);
   });
@@ -1439,7 +1296,7 @@ function bindTikTokEvents(state) {
     await announceLiveIfNeeded(state);
   });
 
-    conn.on(WebcastEvent.LIKE, async (msg) => {
+  conn.on(WebcastEvent.LIKE, async (msg) => {
     updateLiveMetrics(state, msg);
   });
 
@@ -1457,51 +1314,43 @@ function bindTikTokEvents(state) {
 
   conn.on(WebcastEvent.STREAM_END, async ({ action }) => {
     console.log(`[${username}] STREAM_END action=${action}`);
-        state.sessionEndAt = nowIso();
+    state.sessionEndAt = nowIso();
     await announceEndIfNeeded(state);
     resetLiveFlagsAfterEnd(state);
   });
 }
 
-async function ensureLiveConnection(state) {
-  if (state.isConnecting || state.isLive) return;
+async function connectToLiveRoomIfNeeded(state) {
+  if (state.isConnecting) return;
 
+  const isConnected = !!state.conn.getState?.()?.isConnected;
+  if (isConnected) return;
+
+  const now = Date.now();
+
+  if (
+    state.lastConnectAttemptAt &&
+    now - state.lastConnectAttemptAt < CONNECT_COOLDOWN_MS
+  ) {
+    console.log(`[${state.username}] connect skipped by cooldown`);
+    return;
+  }
+
+  state.lastConnectAttemptAt = now;
   state.isConnecting = true;
 
   try {
-    const liveNow = await state.conn.fetchIsLive();
-
-    if (!liveNow) {
-      state.isConnecting = false;
-      return;
-    }
-
-    state.lastLiveAt = state.lastLiveAt || nowIso();
-    state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
-      if (!state.sessionStartAt) {
-    resetSessionMetrics(state);
-  }
-    state.offlineTicks = 0;
-    state.lastPollLive = true;
-    state.isLive = true;
-
-    await hydrateProfileWithRetry(state);
-
-    try {
-      await state.conn.connect();
-    } catch (err) {
-      console.warn(`[${state.username}] connect stream failed:`, err?.message || err);
-    }
-
-    await announceLiveIfNeeded(state);
+    await state.conn.connect();
   } catch (err) {
-    state.isConnecting = false;
     console.warn(`[${state.username}] connect failed:`, err?.message || err);
   } finally {
     state.isConnecting = false;
   }
 }
 
+/* =========================================================
+   POLLING
+========================================================= */
 async function handlePolledOffline(state) {
   state.offlineTicks += 1;
   state.lastPollLive = false;
@@ -1510,7 +1359,6 @@ async function handlePolledOffline(state) {
     state.isLive || state.liveMessageSent || state.announcedLive || !!state.activeSessionId;
 
   if (!hadActiveSession) {
-    resetLiveFlagsAfterEnd(state);
     return;
   }
 
@@ -1522,7 +1370,7 @@ async function handlePolledOffline(state) {
   }
 
   console.log(`[${state.username}] confirmed offline, sending end announcement`);
-    state.sessionEndAt = nowIso();
+  state.sessionEndAt = nowIso();
   await announceEndIfNeeded(state);
   resetLiveFlagsAfterEnd(state);
 }
@@ -1533,21 +1381,16 @@ async function handlePolledLive(state) {
   state.isLive = true;
   state.lastLiveAt = state.lastLiveAt || nowIso();
   state.activeSessionId = state.activeSessionId || `${state.username}:${Date.now()}`;
+
   if (!state.sessionStartAt) {
-  resetSessionMetrics(state);
-}
+    resetSessionMetrics(state);
+  }
+
   state.endAnnounced = false;
 
-  await hydrateProfileWithRetry(state);
+  await refreshProfileIfNeeded(state, false);
   await announceLiveIfNeeded(state);
-
-  if (!state.conn.getState || !state.conn.getState()?.isConnected) {
-    try {
-      await state.conn.connect();
-    } catch (err) {
-      console.warn(`[${state.username}] reconnect watcher failed:`, err?.message || err);
-    }
-  }
+  await connectToLiveRoomIfNeeded(state);
 }
 
 async function sweepTikTokLives() {
@@ -1563,13 +1406,17 @@ async function sweepTikTokLives() {
       } else {
         await handlePolledOffline(state);
       }
+
+      await sleep(1200);
     } catch (err) {
       console.warn(`[${username}] fetchIsLive failed:`, err?.message || err);
     }
   }
 }
 
-// ========= TICKET HELPERS =========
+/* =========================================================
+   TICKET HELPERS
+========================================================= */
 async function createLiveTikTokTicket({ guild, requester, username }) {
   const cleanUsername = normalizeUsername(username);
 
@@ -1642,7 +1489,9 @@ async function lockTicketForUser(channel, requesterId) {
 async function closeTicketChannel(channel, reason = "Closed") {
   try {
     await channel.send(`🔒 Ticket akan ditutup. Alasan: **${reason}**`);
-  } catch {}
+  } catch {
+    // noop
+  }
 
   setTimeout(async () => {
     try {
@@ -1711,7 +1560,9 @@ async function markTicketDone({ interaction, channel, meta, username }) {
   await scheduleAutoCloseTicket(channel);
 }
 
-// ========= INTERACTIONS =========
+/* =========================================================
+   INTERACTIONS
+========================================================= */
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
@@ -1932,18 +1783,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
             ephemeral: true,
           });
         }
-      } catch {}
+      } catch {
+        // noop
+      }
     }
   }
 });
 
-// ========= START =========
+/* =========================================================
+   STARTUP
+========================================================= */
 client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Monitoring: ${TIKTOK_USERNAMES.join(", ")}`);
   console.log(`STAFF_ROLE_ID: ${STAFF_ROLE_ID}`);
-  console.log(`METADATA_RETRY_COUNT: ${METADATA_RETRY_COUNT}`);
-  console.log(`METADATA_RETRY_DELAY_MS: ${METADATA_RETRY_DELAY_MS}`);
+  console.log(`POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS}`);
+  console.log(`OFFLINE_CONFIRM_TICKS: ${OFFLINE_CONFIRM_TICKS}`);
+  console.log(`CONNECT_COOLDOWN_MS: ${CONNECT_COOLDOWN_MS}`);
+  console.log(`PROFILE_REFRESH_COOLDOWN_MS: ${PROFILE_REFRESH_COOLDOWN_MS}`);
   console.log(`DEBUG_TIKTOK_RAW: ${DEBUG_TIKTOK_RAW}`);
 
   try {
@@ -1962,7 +1819,7 @@ client.once("clientReady", async () => {
     } catch (err) {
       console.error("sweepTikTokLives error:", err);
     }
-  }, CHECK_INTERVAL_SECONDS * 1000).unref();
+  }, POLL_INTERVAL_SECONDS * 1000).unref();
 });
 
 client.login(DISCORD_TOKEN);
